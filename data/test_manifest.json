@@ -1,0 +1,31 @@
+{
+  "dataset_metadata": {
+    "created_at": "2026-10-18T00:00:00Z",
+    "seed": 42,
+    "train_domains": [
+      "finance",
+      "commerce"
+    ],
+    "unseen_eval_domains": [
+      "infra",
+      "travel"
+    ],
+    "unseen_eval_count": 500,
+    "bfcl_eval_count": 200,
+    "train_count": 2500
+  },
+  "file_hashes": {
+    "eval_unseen_apis.jsonl": {
+      "sha256": "0a095e8a5b7ab0e2132713a401385caf874008f11b349ee2262cb2fd86f63f7d",
+      "record_count": 500
+    },
+    "eval_bfcl_subset.jsonl": {
+      "sha256": "846d5cb0153e05086eaef7f6a8a6fba770fd95a312d0a5d140b85b6f4c3f383d",
+      "record_count": 200
+    },
+    "train_sft.jsonl": {
+      "sha256": "82a723eafbee2f3074c8ab6d7c8735969c0218ecc086c32749c722d57707c9a6",
+      "record_count": 2500
+    }
+  }
+}
