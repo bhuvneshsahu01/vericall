@@ -107,13 +107,20 @@ def run_dpo_training(
         raw_pairs = load_dpo_dataset()
         train_dataset = Dataset.from_list(raw_pairs)
 
-        dpo_trainer = DPOTrainer(
-            model=model,
-            ref_model=None,  # Unsloth handles reference model implicitly via LoRA adapter disabling
-            args=dpo_config,
-            train_dataset=train_dataset,
-            tokenizer=tokenizer,
-        )
+        import inspect
+        dpo_kwargs = {
+            "model": model,
+            "ref_model": None,
+            "args": dpo_config,
+            "train_dataset": train_dataset,
+        }
+        sig_dpo = inspect.signature(DPOTrainer.__init__).parameters
+        if "processing_class" in sig_dpo:
+            dpo_kwargs["processing_class"] = tokenizer
+        else:
+            dpo_kwargs["tokenizer"] = tokenizer
+
+        dpo_trainer = DPOTrainer(**dpo_kwargs)
 
         logger.info(f"Starting DPO alignment with beta={beta}...")
         dpo_trainer.train()

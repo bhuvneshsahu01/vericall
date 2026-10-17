@@ -110,14 +110,22 @@ def run_sft_training(
             seed=42,
         )
 
-        trainer = SFTTrainer(
-            model=model,
-            tokenizer=tokenizer,
-            train_dataset=train_dataset,
-            dataset_text_field="text",
-            max_seq_length=max_seq_length,
-            args=training_args,
-        )
+        import inspect
+        sft_kwargs = {
+            "model": model,
+            "train_dataset": train_dataset,
+            "dataset_text_field": "text",
+            "args": training_args,
+        }
+        sig = inspect.signature(SFTTrainer.__init__).parameters
+        if "processing_class" in sig:
+            sft_kwargs["processing_class"] = tokenizer
+        else:
+            sft_kwargs["tokenizer"] = tokenizer
+        if "max_seq_length" in sig:
+            sft_kwargs["max_seq_length"] = max_seq_length
+
+        trainer = SFTTrainer(**sft_kwargs)
 
         logger.info("Starting SFT training...")
         trainer.train()
