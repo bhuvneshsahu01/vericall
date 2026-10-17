@@ -94,38 +94,74 @@ def run_sft_training(
         raw_data = load_sft_dataset()
         train_dataset = Dataset.from_list(raw_data)
 
-        training_args = TrainingArguments(
-            output_dir=str(save_path / "runs"),
-            per_device_train_batch_size=batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            warmup_steps=10,
-            num_train_epochs=num_train_epochs,
-            learning_rate=learning_rate,
-            fp16=not is_bfloat16_supported(),
-            bf16=is_bfloat16_supported(),
-            logging_steps=10,
-            optim="adamw_8bit",
-            weight_decay=0.01,
-            lr_scheduler_type="cosine",
-            seed=42,
-        )
-
         import inspect
+        import torch
+
+        try:
+            from trl import SFTConfig
+            HAS_SFT_CONFIG = True
+        except ImportError:
+            HAS_SFT_CONFIG = False
+
+        class SafeSFTTrainer(SFTTrainer):
+            def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+                kwargs = {}
+                if num_items_in_batch is not None:
+                    kwargs["num_items_in_batch"] = num_items_in_batch
+                return super(SFTTrainer, self).compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
+
+        # Cast trainable parameters to float32
+        for p in model.parameters():
+            if p.requires_grad:
+                p.data = p.data.to(torch.float32)
+
+        common_args = {
+            "output_dir": str(save_path / "runs"),
+            "per_device_train_batch_size": batch_size,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
+            "warmup_steps": 10,
+            "num_train_epochs": num_train_epochs,
+            "learning_rate": learning_rate,
+            "fp16": False,
+            "bf16": False,
+            "logging_steps": 10,
+            "optim": "adamw_torch",
+            "weight_decay": 0.01,
+            "lr_scheduler_type": "cosine",
+            "seed": 42,
+            "report_to": "none",
+        }
+
         sft_kwargs = {
             "model": model,
             "train_dataset": train_dataset,
-            "dataset_text_field": "text",
-            "args": training_args,
         }
+
+        if HAS_SFT_CONFIG:
+            sft_cfg_params = inspect.signature(SFTConfig.__init__).parameters
+            cfg_kwargs = dict(common_args)
+            if "dataset_text_field" in sft_cfg_params:
+                cfg_kwargs["dataset_text_field"] = "text"
+            if "max_length" in sft_cfg_params:
+                cfg_kwargs["max_length"] = max_seq_length
+            elif "max_seq_length" in sft_cfg_params:
+                cfg_kwargs["max_seq_length"] = max_seq_length
+            training_args = SFTConfig(**cfg_kwargs)
+        else:
+            training_args = TrainingArguments(**common_args)
+            sft_kwargs["dataset_text_field"] = "text"
+
+        sft_kwargs["args"] = training_args
+
         sig = inspect.signature(SFTTrainer.__init__).parameters
         if "processing_class" in sig:
             sft_kwargs["processing_class"] = tokenizer
         else:
             sft_kwargs["tokenizer"] = tokenizer
-        if "max_seq_length" in sig:
+        if "max_seq_length" in sig and not HAS_SFT_CONFIG:
             sft_kwargs["max_seq_length"] = max_seq_length
 
-        trainer = SFTTrainer(**sft_kwargs)
+        trainer = SafeSFTTrainer(**sft_kwargs)
 
         logger.info("Starting SFT training...")
         trainer.train()
