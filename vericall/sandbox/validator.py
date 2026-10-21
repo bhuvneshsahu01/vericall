@@ -1,21 +1,23 @@
 """
-ToolCallValidator: Execution-Verified Tool Calling Analysis.
-Inspects LLM function calls against strict Pydantic schemas and returns
-mutually exclusive error taxonomy labels:
-- success
-- wrong_endpoint
-- missing_arg
-- hallucinated_arg
-- type_error
+vericall/sandbox/validator.py
+-----------------------------
+ExecutionValidator for VeriCall Tool Calling Sandbox.
+Enforces the strict 6-state error taxonomy:
+- "passed" (HTTP 200 execution, 0 schema errors)
+- "invalid_json" (malformed JSON or missing "name"/"arguments")
+- "wrong_endpoint" (selected decoy tool or unknown endpoint)
+- "missing_arg" (omitted required parameter)
+- "hallucinated_arg" (added parameter key not in schema, violating extra="forbid")
+- "type_error" (wrong data type, invalid Enum value, or regex/pattern failure)
 """
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from pydantic import ValidationError
+from fastapi.testclient import TestClient
 
 from .app import ENDPOINT_REGISTRY, app
-from fastapi.testclient import TestClient
 
 client = TestClient(app)
 
@@ -23,7 +25,7 @@ client = TestClient(app)
 @dataclass
 class ValidationResult:
     """Standardized verification outcome for a candidate tool call."""
-    status: str  # "success", "wrong_endpoint", "missing_arg", "hallucinated_arg", "type_error"
+    status: str  # "passed", "invalid_json", "wrong_endpoint", "missing_arg", "hallucinated_arg", "type_error"
     is_success: bool
     function_name: str
     arguments: Dict[str, Any]
@@ -43,9 +45,9 @@ class ValidationResult:
         }
 
 
-class ToolCallValidator:
+class ExecutionValidator:
     """
-    Validates LLM tool invocations against schema definitions and runs them
+    Validates LLM tool invocations against strict Pydantic V2 schemas and runs them
     in the execution sandbox.
     """
 
@@ -54,54 +56,85 @@ class ToolCallValidator:
 
     def validate_call(
         self,
-        func_name: str,
-        arguments: Any,
+        raw_prediction: Any,
         expected_func: Optional[str] = None,
+        candidate_tools: Optional[List[Dict[str, Any]]] = None,
     ) -> ValidationResult:
         """
-        Validates function invocation.
+        Validates function invocation against schema and execution sandbox.
 
         Parameters:
         -----------
-        func_name: Candidate function name predicted by the model.
-        arguments: Candidate dictionary or JSON string of arguments.
-        expected_func: Optional ground-truth function name for endpoint validation.
+        raw_prediction: Dict or JSON string predicted by model, e.g. {"name": "...", "arguments": {...}}
+                        or raw function name string if arguments passed separately.
+        expected_func: Expected ground-truth tool name.
+        candidate_tools: Optional list of candidate tool schema dicts available in the prompt context.
 
         Returns:
         --------
         ValidationResult with structured error taxonomy label.
         """
-        # Parse arguments if passed as JSON string
-        parsed_args = arguments
-        if isinstance(arguments, str):
+        func_name = ""
+        arguments: Any = {}
+
+        # 1. Parse JSON / Structure Check
+        if isinstance(raw_prediction, str):
             try:
-                parsed_args = json.loads(arguments)
+                parsed = json.loads(raw_prediction)
             except Exception as e:
                 return ValidationResult(
-                    status="type_error",
+                    status="invalid_json",
                     is_success=False,
-                    function_name=func_name,
+                    function_name="",
                     arguments={},
-                    error_message=f"Invalid JSON in arguments: {str(e)}",
+                    error_message=f"Malformed JSON: {str(e)}",
                 )
+        elif isinstance(raw_prediction, dict):
+            parsed = raw_prediction
+        else:
+            return ValidationResult(
+                status="invalid_json",
+                is_success=False,
+                function_name="",
+                arguments={},
+                error_message=f"Prediction must be a dict or JSON string, got {type(raw_prediction).__name__}",
+            )
 
-        if not isinstance(parsed_args, dict):
+        # Check for standard "name" and "arguments" keys
+        if not isinstance(parsed, dict) or "name" not in parsed or "arguments" not in parsed:
+            # Fallback if prediction is already the arguments dict and expected_func is given
+            if expected_func and isinstance(parsed, dict) and "name" not in parsed:
+                func_name = expected_func
+                arguments = parsed
+            else:
+                return ValidationResult(
+                    status="invalid_json",
+                    is_success=False,
+                    function_name=str(parsed.get("name", "")),
+                    arguments={},
+                    error_message="Prediction missing required 'name' or 'arguments' keys.",
+                )
+        else:
+            func_name = parsed.get("name", "")
+            arguments = parsed.get("arguments", {})
+
+        if not isinstance(arguments, dict):
             return ValidationResult(
                 status="type_error",
                 is_success=False,
-                function_name=func_name,
-                arguments={"raw": str(arguments)},
-                error_message=f"Arguments must be a key-value dictionary, got {type(parsed_args).__name__}",
+                function_name=str(func_name),
+                arguments={},
+                error_message=f"'arguments' must be a key-value dictionary, got {type(arguments).__name__}",
             )
 
-        # 1. Endpoint Existence & Selection Check
+        # 2. Endpoint Existence & Selection Check
         if func_name not in self.registry:
             return ValidationResult(
                 status="wrong_endpoint",
                 is_success=False,
                 function_name=func_name,
-                arguments=parsed_args,
-                error_message=f"Function '{func_name}' is not in the allowed API schema registry.",
+                arguments=arguments,
+                error_message=f"Tool '{func_name}' is not in the allowed API schema registry.",
             )
 
         if expected_func and func_name != expected_func:
@@ -109,16 +142,17 @@ class ToolCallValidator:
                 status="wrong_endpoint",
                 is_success=False,
                 function_name=func_name,
-                arguments=parsed_args,
+                arguments=arguments,
                 error_message=f"Selected wrong endpoint '{func_name}' (expected '{expected_func}').",
             )
 
         spec = self.registry[func_name]
         model_cls = spec["model"]
+        route = spec["route"]
 
-        # 2. Check for Hallucinated Arguments (Extra keys not defined in Pydantic schema)
+        # 3. Check for Hallucinated Arguments (Extra top-level keys not in model_fields)
         defined_fields = set(model_cls.model_fields.keys())
-        provided_fields = set(parsed_args.keys())
+        provided_fields = set(arguments.keys())
         extra_fields = provided_fields - defined_fields
         if extra_fields:
             first_extra = sorted(list(extra_fields))[0]
@@ -126,18 +160,18 @@ class ToolCallValidator:
                 status="hallucinated_arg",
                 is_success=False,
                 function_name=func_name,
-                arguments=parsed_args,
+                arguments=arguments,
                 error_message=f"Hallucinated argument '{first_extra}' not present in {func_name} schema.",
                 error_field=first_extra,
             )
 
-        # 3. Pydantic Model Validation
+        # 4. Pydantic Model Validation (Catches missing args, type errors, enum mismatches, nested extra keys)
         try:
-            validated_instance = model_cls.model_validate(parsed_args)
+            validated_instance = model_cls.model_validate(arguments)
         except ValidationError as val_err:
             first_err = val_err.errors()[0]
             err_type = first_err.get("type", "")
-            err_loc = first_err.get("loc", ["unknown"])[0]
+            err_loc = ".".join(str(x) for x in first_err.get("loc", ["unknown"]))
             err_msg = first_err.get("msg", "Validation error")
 
             # Check if missing required parameter
@@ -146,17 +180,17 @@ class ToolCallValidator:
                     status="missing_arg",
                     is_success=False,
                     function_name=func_name,
-                    arguments=parsed_args,
+                    arguments=arguments,
                     error_message=f"Missing required parameter '{err_loc}' in call to {func_name}.",
                     error_field=str(err_loc),
                 )
-            elif "extra_forbidden" in err_type:
+            elif "extra_forbidden" in err_type or "extra" in err_msg.lower():
                 return ValidationResult(
                     status="hallucinated_arg",
                     is_success=False,
                     function_name=func_name,
-                    arguments=parsed_args,
-                    error_message=f"Hallucinated argument '{err_loc}'.",
+                    arguments=arguments,
+                    error_message=f"Hallucinated argument '{err_loc}' violating extra='forbid'.",
                     error_field=str(err_loc),
                 )
             else:
@@ -164,47 +198,40 @@ class ToolCallValidator:
                     status="type_error",
                     is_success=False,
                     function_name=func_name,
-                    arguments=parsed_args,
+                    arguments=arguments,
                     error_message=f"Type or constraint validation error on '{err_loc}': {err_msg}",
                     error_field=str(err_loc),
                 )
 
-        # 4. Sandbox Execution
-        # Map function name to FastAPI endpoint route
-        endpoint_routes = {
-            "get_stock_quote": "/finance/stock-quote",
-            "execute_trade": "/finance/trade",
-            "get_account_balance": "/finance/balance",
-            "search_products": "/commerce/products/search",
-            "create_order": "/commerce/orders/create",
-            "track_shipment": "/commerce/shipments/track",
-            "provision_server": "/infra/servers/provision",
-            "restart_service": "/infra/services/restart",
-            "get_cluster_metrics": "/infra/clusters/metrics",
-            "search_flights": "/travel/flights/search",
-            "book_hotel": "/travel/hotels/book",
-            "cancel_booking": "/travel/bookings/cancel",
-        }
-
-        route = endpoint_routes.get(func_name)
-        exec_resp = None
-        if route:
-            resp = client.post(route, json=validated_instance.model_dump())
+        # 5. Sandbox Live Execution via TestClient
+        try:
+            payload = validated_instance.model_dump()
+            resp = client.post(route, json=payload)
             if resp.status_code == 200:
-                exec_resp = resp.json()
+                return ValidationResult(
+                    status="passed",
+                    is_success=True,
+                    function_name=func_name,
+                    arguments=arguments,
+                    execution_response=resp.json(),
+                )
             else:
                 return ValidationResult(
                     status="type_error",
                     is_success=False,
                     function_name=func_name,
-                    arguments=parsed_args,
+                    arguments=arguments,
                     error_message=f"Sandbox endpoint returned HTTP {resp.status_code}: {resp.text}",
                 )
+        except Exception as e:
+            return ValidationResult(
+                status="type_error",
+                is_success=False,
+                function_name=func_name,
+                arguments=arguments,
+                error_message=f"Execution error: {str(e)}",
+            )
 
-        return ValidationResult(
-            status="success",
-            is_success=True,
-            function_name=func_name,
-            arguments=parsed_args,
-            execution_response=exec_resp,
-        )
+
+# Backwards compatibility alias
+ToolCallValidator = ExecutionValidator

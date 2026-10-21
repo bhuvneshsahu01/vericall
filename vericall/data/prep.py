@@ -2,13 +2,13 @@
 vericall/data/prep.py
 ---------------------
 Dataset generation and strict domain-split decontamination.
-Splits by API domain so unseen test APIs have ZERO domain or schema overlap with training APIs.
-
 Generates:
-- data/eval_unseen_apis.jsonl: Exactly M=500 requests from unseen domains (infra, travel)
-- data/eval_bfcl_subset.jsonl: 200 decontaminated general function calling requests
-- data/train_sft.jsonl: 2,500 requests exclusively from training domains (finance, commerce)
-- data/test_manifest.json: SHA-256 hashes of frozen evaluation sets.
+- data/eval_unseen_apis.jsonl: Exactly M=500 requests across 6 unseen endpoints (infra, travel).
+  Every prompt contains all 6 unseen tool schemas (1 target + 5 decoys, shuffled).
+- data/train_sft.jsonl: Exactly N=2,000 requests across 10 training endpoints (finance, commerce, crm).
+  Every prompt contains 6 candidate schemas (1 target + 5 decoys sampled from train endpoints).
+- data/eval_bfcl_subset.jsonl: 200 decontaminated general function calling requests.
+- data/test_manifest.json: SHA-256 hashes of frozen evaluation and training sets.
 """
 
 import hashlib
@@ -18,6 +18,9 @@ import random
 from pathlib import Path
 from typing import Any, Dict, List
 
+from vericall.sandbox.app import ENDPOINT_REGISTRY, get_tool_json_schema
+from vericall.sandbox.validator import ExecutionValidator
+
 SEED = 42
 random.seed(SEED)
 
@@ -25,342 +28,449 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = REPO_ROOT / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-
-# ============================================================================
-# TEMPLATE GENERATORS FOR TRAINING APIS (Finance & Commerce)
-# ============================================================================
-
-FINANCE_TEMPLATES = [
-    (
-        "Can you check the current market price for {symbol} on the {exchange}?",
-        "get_stock_quote",
-        lambda sym, ex: {"symbol": sym, "exchange": ex},
-    ),
-    (
-        "Please get me a stock quote for ticker {symbol}.",
-        "get_stock_quote",
-        lambda sym, ex: {"symbol": sym},
-    ),
-    (
-        "Execute a market buy order for {quantity} shares of {symbol} from account {account_id}.",
-        "execute_trade",
-        lambda sym, ex, acc, qty, otype, lprice: {
-            "account_id": acc,
-            "symbol": sym,
-            "quantity": qty,
-            "order_type": "market",
-        },
-    ),
-    (
-        "Place a limit order to purchase {quantity} shares of {symbol} at limit price ${limit_price:.2f} for account {account_id}.",
-        "execute_trade",
-        lambda sym, ex, acc, qty, otype, lprice: {
-            "account_id": acc,
-            "symbol": sym,
-            "quantity": qty,
-            "order_type": "limit",
-            "limit_price": lprice,
-        },
-    ),
-    (
-        "What is the available cash balance and total portfolio value for account {account_id} in {currency}?",
-        "get_account_balance",
-        lambda acc, curr: {"account_id": acc, "currency": curr},
-    ),
+# Endpoint classifications
+TRAIN_ENDPOINTS = [
+    "issue_refund",
+    "create_invoice",
+    "transfer_funds",
+    "audit_ledger_entries",
+    "query_inventory",
+    "apply_discount_code",
+    "update_subscription",
+    "create_support_ticket",
+    "update_customer_tier",
+    "schedule_webhook",
 ]
 
-COMMERCE_TEMPLATES = [
-    (
-        "Find in-stock {category} items matching '{query}' under ${max_price:.2f}.",
-        "search_products",
-        lambda q, cat, p: {"query": q, "category": cat, "max_price": p, "in_stock_only": True},
-    ),
-    (
-        "Search our product catalog for '{query}' in the {category} department.",
-        "search_products",
-        lambda q, cat, p: {"query": q, "category": cat},
-    ),
-    (
-        "Create an order for customer {customer_id} shipping to {city}, postal code {zipcode} with item {prod_id} quantity {qty}.",
-        "create_order",
-        lambda cid, city, zcode, pid, qty: {
-            "customer_id": cid,
-            "items": [{"product_id": pid, "quantity": qty}],
-            "shipping_city": city,
-            "postal_code": zcode,
-        },
-    ),
-    (
-        "Track package {tracking_num} being delivered via {carrier}.",
-        "track_shipment",
-        lambda tnum, carr: {"tracking_number": tnum, "carrier": carr},
-    ),
+UNSEEN_ENDPOINTS = [
+    "provision_compute_node",
+    "scale_kubernetes_cluster",
+    "rotate_iam_credentials",
+    "search_multi_leg_flights",
+    "reserve_corporate_hotel",
+    "cancel_itinerary_segment",
 ]
 
 
-# ============================================================================
-# TEMPLATE GENERATORS FOR UNSEEN TEST APIS (Infra & Travel)
-# Zero domain overlap with training
-# ============================================================================
-
-INFRA_TEMPLATES = [
-    (
-        "Provision {count} {instance_type} compute servers in {region} for our {env} environment.",
-        "provision_server",
-        lambda itype, reg, cnt, env: {
-            "instance_type": itype,
-            "region": reg,
-            "count": cnt,
-            "environment": env,
-        },
-    ),
-    (
-        "Perform a restart on service '{service}' running in cluster '{cluster}'.",
-        "restart_service",
-        lambda srv, clus: {"service_name": srv, "cluster_id": clus, "force": False},
-    ),
-    (
-        "Force restart microservice '{service}' immediately on cluster '{cluster}'.",
-        "restart_service",
-        lambda srv, clus: {"service_name": srv, "cluster_id": clus, "force": True},
-    ),
-    (
-        "Get {metric} telemetry for cluster '{cluster}' aggregated over the past {minutes} minutes.",
-        "get_cluster_metrics",
-        lambda clus, met, mins: {
-            "cluster_id": clus,
-            "metric_name": met,
-            "time_window_minutes": mins,
-        },
-    ),
-]
-
-TRAVEL_TEMPLATES = [
-    (
-        "Search for {cabin} class flights from {origin} to {dest} on {date} for {passengers} passengers.",
-        "search_flights",
-        lambda orig, dest, dt, pax, cab: {
-            "origin_airport": orig,
-            "destination_airport": dest,
-            "departure_date": dt,
-            "passengers": pax,
-            "cabin_class": cab,
-        },
-    ),
-    (
-        "Book a {room} room at hotel {hotel_id} checking in on {checkin} and checking out on {checkout} for {guests} guests.",
-        "book_hotel",
-        lambda hid, cin, cout, gsts, rm: {
-            "hotel_id": hid,
-            "checkin_date": cin,
-            "checkout_date": cout,
-            "guests": gsts,
-            "room_type": rm,
-        },
-    ),
-    (
-        "Cancel travel booking confirmation '{booking_id}' because of {reason} and process a refund.",
-        "cancel_booking",
-        lambda bid, rsn: {"booking_id": bid, "reason": rsn, "refund_requested": True},
-    ),
-]
-
-
-def generate_training_data(num_samples: int = 2500) -> List[Dict[str, Any]]:
-    """Generates training examples strictly from finance and commerce domains."""
-    symbols = ["AAPL", "NVDA", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "AMD"]
-    exchanges = ["NASDAQ", "NYSE"]
-    order_types = ["market", "limit", "stop"]
-    currencies = ["USD", "EUR", "GBP", "JPY"]
-    queries = ["ergonomic keyboard", "wireless noise cancelling headphones", "ultrawide monitor", "running shoes"]
-    categories = ["electronics", "apparel", "home_goods", "books"]
-    carriers = ["fedex", "ups", "dhl", "usps"]
-    cities = ["New York", "San Francisco", "Austin", "Seattle", "Chicago", "Boston"]
-
-    train_data = []
-    for idx in range(num_samples):
-        if idx % 2 == 0:
-            # Finance
-            tmpl_idx = idx % len(FINANCE_TEMPLATES)
-            sym = random.choice(symbols)
-            ex = random.choice(exchanges)
-            acc = f"acc_{random.randint(10000, 99999)}"
-            qty = random.randint(1, 500)
-            otype = random.choice(order_types)
-            lprice = round(random.uniform(50.0, 500.0), 2)
-            curr = random.choice(currencies)
-
-            if tmpl_idx == 0:
-                q = FINANCE_TEMPLATES[0][0].format(symbol=sym, exchange=ex)
-                target = FINANCE_TEMPLATES[0][1]
-                args = FINANCE_TEMPLATES[0][2](sym, ex)
-            elif tmpl_idx == 1:
-                q = FINANCE_TEMPLATES[1][0].format(symbol=sym)
-                target = FINANCE_TEMPLATES[1][1]
-                args = FINANCE_TEMPLATES[1][2](sym, ex)
-            elif tmpl_idx == 2:
-                q = FINANCE_TEMPLATES[2][0].format(quantity=qty, symbol=sym, account_id=acc)
-                target = FINANCE_TEMPLATES[2][1]
-                args = FINANCE_TEMPLATES[2][2](sym, ex, acc, qty, otype, lprice)
-            elif tmpl_idx == 3:
-                q = FINANCE_TEMPLATES[3][0].format(quantity=qty, symbol=sym, limit_price=lprice, account_id=acc)
-                target = FINANCE_TEMPLATES[3][1]
-                args = FINANCE_TEMPLATES[3][2](sym, ex, acc, qty, otype, lprice)
-            else:
-                q = FINANCE_TEMPLATES[4][0].format(account_id=acc, currency=curr)
-                target = FINANCE_TEMPLATES[4][1]
-                args = FINANCE_TEMPLATES[4][2](acc, curr)
-
-            domain = "finance"
-        else:
-            # Commerce
-            tmpl_idx = idx % len(COMMERCE_TEMPLATES)
-            q_term = random.choice(queries)
-            cat = random.choice(categories)
-            max_p = round(random.uniform(25.0, 450.0), 2)
-            cid = f"cust_{random.randint(1000, 9999)}"
-            city = random.choice(cities)
-            zcode = f"{random.randint(10001, 99999)}"
-            pid = f"prod_{random.randint(100, 999)}"
-            qty = random.randint(1, 5)
-            tnum = f"TRK{random.randint(10000000, 99999999)}"
-            carr = random.choice(carriers)
-
-            if tmpl_idx == 0:
-                q = COMMERCE_TEMPLATES[0][0].format(category=cat, query=q_term, max_price=max_p)
-                target = COMMERCE_TEMPLATES[0][1]
-                args = COMMERCE_TEMPLATES[0][2](q_term, cat, max_p)
-            elif tmpl_idx == 1:
-                q = COMMERCE_TEMPLATES[1][0].format(query=q_term, category=cat)
-                target = COMMERCE_TEMPLATES[1][1]
-                args = COMMERCE_TEMPLATES[1][2](q_term, cat, max_p)
-            elif tmpl_idx == 2:
-                q = COMMERCE_TEMPLATES[2][0].format(customer_id=cid, city=city, zipcode=zcode, prod_id=pid, qty=qty)
-                target = COMMERCE_TEMPLATES[2][1]
-                args = COMMERCE_TEMPLATES[2][2](cid, city, zcode, pid, qty)
-            else:
-                q = COMMERCE_TEMPLATES[3][0].format(tracking_num=tnum, carrier=carr)
-                target = COMMERCE_TEMPLATES[3][1]
-                args = COMMERCE_TEMPLATES[3][2](tnum, carr)
-
-            domain = "commerce"
-
-        train_data.append({
-            "id": f"train_{domain}_{idx:04d}",
-            "domain": domain,
-            "query": q,
-            "target_function": target,
-            "target_arguments": args,
-        })
-
-    return train_data
-
-
-def generate_unseen_eval_data(num_samples: int = 500) -> List[Dict[str, Any]]:
+def build_tool_calling_prompt(user_query: str, candidate_schemas: List[Dict[str, Any]]) -> str:
     """
-    Generates EXACTLY M=500 requests strictly from unseen domains:
-    250 from Infrastructure, 250 from Travel.
+    Standard tool-calling prompt injection format.
+    Every prompt contains 6 JSON tool schemas in Available Tools.
     """
-    instance_types = ["t3.micro", "t3.medium", "c5.xlarge", "g4dn.xlarge"]
-    regions = ["us-east-1", "us-west-2", "eu-west-1", "ap-northeast-1"]
-    environments = ["dev", "staging", "prod"]
-    services = ["auth-service", "payment-gateway", "worker-queue", "recommendation-api", "ingest-pipeline"]
-    clusters = ["k8s-prod-us", "ecs-analytics", "k8s-core-eu", "dev-microservices"]
-    metrics = ["cpu_utilization", "memory_utilization", "disk_iops", "network_in"]
+    tools_block = json.dumps(candidate_schemas, indent=2)
+    system_msg = (
+        "You are a precise REST API tool-calling assistant. Given the user request, select "
+        "the single most appropriate tool from the `Available Tools` JSON schema list below "
+        "and output ONLY a single valid JSON object with keys \"name\" and \"arguments\". "
+        "Do not invent parameter names outside the selected tool's schema, and strictly "
+        "follow all parameter types, enums, and formatting rules.\n\n"
+        f"Available Tools:\n{tools_block}\n\n"
+        "Output format:\n"
+        '{\"name\": \"<tool_name>\", \"arguments\": {<exact_schema_parameters>}}'
+    )
+    return (
+        f"<|im_start|>system\n{system_msg}<|im_end|>\n"
+        f"<|im_start|>user\n{user_query}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
 
-    airports = ["SFO", "JFK", "LAX", "ORD", "LHR", "HND", "CDG", "SEA", "DFW", "BOS"]
-    cabin_classes = ["economy", "premium_economy", "business", "first"]
-    room_types = ["standard", "deluxe", "suite"]
-    reasons = ["schedule_change", "found_cheaper", "emergency", "other"]
 
-    unseen_data = []
-    half = num_samples // 2
+def sample_candidate_tools(target_tool: str, domain_pool: List[str], total_count: int = 6, seed: int = 42) -> List[Dict[str, Any]]:
+    """
+    Samples candidate tools (target + decoys) and shuffles deterministically.
+    """
+    rng = random.Random(seed)
+    decoys = [ep for ep in domain_pool if ep != target_tool]
+    sampled_decoys = rng.sample(decoys, min(total_count - 1, len(decoys)))
+    selected_tools = [target_tool] + sampled_decoys
+    rng.shuffle(selected_tools)
+    return [get_tool_json_schema(name) for name in selected_tools]
 
-    # 1. 250 Infrastructure requests
-    for i in range(half):
-        tmpl_idx = i % len(INFRA_TEMPLATES)
-        itype = random.choice(instance_types)
-        reg = random.choice(regions)
-        cnt = random.randint(1, 10)
-        env = random.choice(environments)
-        srv = random.choice(services)
-        clus = random.choice(clusters)
-        met = random.choice(metrics)
-        mins = random.choice([15, 30, 60, 120, 240, 720, 1440])
 
-        if tmpl_idx == 0:
-            q = INFRA_TEMPLATES[0][0].format(count=cnt, instance_type=itype, region=reg, env=env)
-            target = INFRA_TEMPLATES[0][1]
-            args = INFRA_TEMPLATES[0][2](itype, reg, cnt, env)
-        elif tmpl_idx == 1:
-            q = INFRA_TEMPLATES[1][0].format(service=srv, cluster=clus)
-            target = INFRA_TEMPLATES[1][1]
-            args = INFRA_TEMPLATES[1][2](srv, clus)
-        elif tmpl_idx == 2:
-            q = INFRA_TEMPLATES[2][0].format(service=srv, cluster=clus)
-            target = INFRA_TEMPLATES[2][1]
-            args = INFRA_TEMPLATES[2][2](srv, clus)
-        else:
-            q = INFRA_TEMPLATES[3][0].format(metric=met, cluster=clus, minutes=mins)
-            target = INFRA_TEMPLATES[3][1]
-            args = INFRA_TEMPLATES[3][2](clus, met, mins)
+# ============================================================================
+# TEMPLATE GENERATORS FOR 10 TRAINING APIS
+# ============================================================================
 
-        unseen_data.append({
-            "id": f"eval_unseen_infra_{i:03d}",
-            "domain": "infra",
-            "query": q,
-            "target_function": target,
-            "target_arguments": args,
-        })
-
-    # 2. 250 Travel requests
-    for i in range(half):
-        tmpl_idx = i % len(TRAVEL_TEMPLATES)
-        orig, dest = random.sample(airports, 2)
-        day = random.randint(10, 28)
-        dt = f"2026-11-{day:02d}"
-        pax = random.randint(1, 4)
-        cab = random.choice(cabin_classes)
-        hid = f"htl_{random.randint(100, 999)}"
-        cin = f"2026-11-{day:02d}"
-        cout = f"2026-11-{day+3:02d}"
-        gsts = random.randint(1, 4)
-        rm = random.choice(room_types)
-        bid = f"BKG{random.randint(100000, 999999)}"
+def generate_finance_samples(count_per_endpoint: int = 200) -> List[Dict[str, Any]]:
+    samples = []
+    
+    # 1. issue_refund
+    reasons = ["CUSTOMER_RETURN", "DUPLICATE_CHARGE", "FRAUDULENT", "SERVICE_OUTAGE"]
+    currencies = ["USD", "EUR", "GBP", "INR"]
+    for i in range(count_per_endpoint):
+        tx_id = f"txn_{random.randint(10000000, 99999999)}"
+        amt = round(random.uniform(15.0, 4500.0), 2)
+        curr = random.choice(currencies)
         rsn = random.choice(reasons)
+        agent = f"agent_{random.randint(10, 99)}"
+        args = {
+            "transaction_id": tx_id,
+            "amount": amt,
+            "currency": curr,
+            "reason": rsn,
+            "metadata": {"approved_by": agent, "dept": "finance"},
+        }
+        query = f"Issue a full refund of {amt} {curr} for transaction {tx_id} due to {rsn.replace('_', ' ').lower()}. Verified by {agent}."
+        samples.append(("issue_refund", query, args))
 
-        if tmpl_idx == 0:
-            q = TRAVEL_TEMPLATES[0][0].format(cabin=cab, origin=orig, dest=dest, date=dt, passengers=pax)
-            target = TRAVEL_TEMPLATES[0][1]
-            args = TRAVEL_TEMPLATES[0][2](orig, dest, dt, pax, cab)
-        elif tmpl_idx == 1:
-            q = TRAVEL_TEMPLATES[1][0].format(room=rm, hotel_id=hid, checkin=cin, checkout=cout, guests=gsts)
-            target = TRAVEL_TEMPLATES[1][1]
-            args = TRAVEL_TEMPLATES[1][2](hid, cin, cout, gsts, rm)
-        else:
-            q = TRAVEL_TEMPLATES[2][0].format(booking_id=bid, reason=rsn)
-            target = TRAVEL_TEMPLATES[2][1]
-            args = TRAVEL_TEMPLATES[2][2](bid, rsn)
+    # 2. create_invoice
+    for i in range(count_per_endpoint):
+        cli_id = f"cli_{random.randint(1000, 99999)}"
+        curr = random.choice(currencies)
+        day_issue = random.randint(1, 15)
+        day_due = day_issue + 14
+        iss_date = f"2026-11-{day_issue:02d}"
+        due_date = f"2026-11-{day_due:02d}"
+        items = [
+            {"description": "Enterprise Platform License", "unit_price": float(random.randint(500, 3000)), "quantity": 1},
+            {"description": "Technical Support Hours", "unit_price": 150.0, "quantity": random.randint(2, 10)},
+        ]
+        args = {
+            "client_id": cli_id,
+            "issue_date": iss_date,
+            "due_date": due_date,
+            "line_items": items,
+            "currency": curr,
+        }
+        query = f"Create an invoice for client {cli_id} issued on {iss_date} and due on {due_date} in {curr} with {len(items)} line items."
+        samples.append(("create_invoice", query, args))
 
-        unseen_data.append({
-            "id": f"eval_unseen_travel_{i:03d}",
-            "domain": "travel",
-            "query": q,
-            "target_function": target,
+    # 3. transfer_funds
+    networks = ["ACH", "WIRE", "SWIFT", "SEPA"]
+    for i in range(count_per_endpoint):
+        src = f"acc_{random.randint(100000, 999999)}"
+        dst = f"acc_{random.randint(100000, 999999)}"
+        amt = float(random.randint(100, 25000))
+        net = random.choice(networks)
+        memo = f"Vendor payout settlement ref {random.randint(100, 999)}"
+        args = {
+            "source_account": src,
+            "destination_account": dst,
+            "amount": amt,
+            "transfer_method": net,
+            "memo": memo,
+        }
+        query = f"Transfer {amt} from {src} to {dst} via {net} with memo '{memo}'."
+        samples.append(("transfer_funds", query, args))
+
+    # 4. audit_ledger_entries
+    entry_types = ["CREDIT", "DEBIT", "ADJUSTMENT", "TRANSFER"]
+    for i in range(count_per_endpoint):
+        ledg = f"ledg_{random.randint(100000, 999999)}"
+        s_date = f"2026-10-01"
+        e_date = f"2026-10-31"
+        etype = random.choice(entry_types)
+        args = {
+            "ledger_id": ledg,
+            "start_date": s_date,
+            "end_date": e_date,
+            "entry_type": etype,
+            "filter_flags": {"reconciled_only": True, "flagged": False},
+        }
+        query = f"Audit {etype} ledger entries for partition {ledg} from {s_date} to {e_date} with reconciled_only set to True."
+        samples.append(("audit_ledger_entries", query, args))
+
+    return samples
+
+
+def generate_commerce_samples(count_per_endpoint: int = 200) -> List[Dict[str, Any]]:
+    samples = []
+    
+    # 5. query_inventory
+    channels = ["IN_STORE", "WAREHOUSE_DIRECT", "DROPSHIP"]
+    for i in range(count_per_endpoint):
+        skus = [f"SKU-{random.choice(['PROD', 'PART', 'TOOL'])}{random.randint(10, 99)}" for _ in range(random.randint(1, 3))]
+        wh = f"wh_{random.choice(['us', 'eu', 'ap'])}-{random.randint(10, 99)}"
+        chn = random.choice(channels)
+        args = {
+            "sku_list": skus,
+            "warehouse_id": wh,
+            "include_out_of_stock": False,
+            "fulfillment_channel": chn,
+        }
+        query = f"Check in-stock inventory levels for items {', '.join(skus)} at facility {wh} via {chn} fulfillment."
+        samples.append(("query_inventory", query, args))
+
+    # 6. apply_discount_code
+    pos_channels = ["ONLINE_WEB", "MOBILE_APP", "POS_REGISTER"]
+    for i in range(count_per_endpoint):
+        cid = f"cart_{random.randint(100000, 999999)}"
+        promo = f"SAVE_{random.choice(['FALL', 'WINTER', 'VIP'])}{random.randint(10, 50)}"
+        chn = random.choice(pos_channels)
+        pin = random.randint(1000, 9999)
+        args = {
+            "cart_id": cid,
+            "promo_code": promo,
+            "channel": chn,
+            "customer_loyalty_pin": pin,
+        }
+        query = f"Apply discount promo code '{promo}' to shopping cart {cid} from channel {chn} with loyalty PIN {pin}."
+        samples.append(("apply_discount_code", query, args))
+
+    # 7. update_subscription
+    plans = ["BASIC_MONTHLY", "PRO_MONTHLY", "ENTERPRISE_ANNUAL"]
+    for i in range(count_per_endpoint):
+        sid = f"sub_{random.randint(10000000, 99999999)}"
+        plan = random.choice(plans)
+        eff = f"2026-12-01"
+        args = {
+            "subscription_id": sid,
+            "plan_tier": plan,
+            "auto_renew": True,
+            "addon_features": ["audit_logs", "priority_support"],
+            "effective_date": eff,
+        }
+        query = f"Update subscription {sid} to plan tier {plan} with auto-renew enabled and effective date {eff}."
+        samples.append(("update_subscription", query, args))
+
+    return samples
+
+
+def generate_crm_samples(count_per_endpoint: int = 200) -> List[Dict[str, Any]]:
+    samples = []
+    
+    # 8. create_support_ticket
+    priorities = ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+    depts = ["BILLING", "TECHNICAL", "ACCOUNT", "SHIPPING"]
+    for i in range(count_per_endpoint):
+        cid = f"cust_{random.randint(10000, 99999)}"
+        prio = random.choice(priorities)
+        dept = random.choice(depts)
+        subj = f"Issue regarding recent service order #{random.randint(1000, 9999)}"
+        args = {
+            "customer_id": cid,
+            "priority": prio,
+            "department": dept,
+            "subject": subj,
+            "ticket_context": {"origin": "web_portal", "browser": "chrome"},
+        }
+        query = f"Open a {prio} priority {dept} support ticket for customer {cid} regarding '{subj}'."
+        samples.append(("create_support_ticket", query, args))
+
+    # 9. update_customer_tier
+    tiers = ["BRONZE", "SILVER", "GOLD", "PLATINUM"]
+    for i in range(count_per_endpoint):
+        cid = f"cust_{random.randint(10000, 99999)}"
+        tier = random.choice(tiers)
+        rep = f"rep_{random.randint(1000, 9999)}"
+        reason = f"Annual spending threshold exceeded tier criteria #{random.randint(100, 999)}"
+        args = {
+            "customer_id": cid,
+            "target_tier": tier,
+            "assigned_rep_id": rep,
+            "override_reason": reason,
+            "benefits": ["waived_fees", "dedicated_rep"],
+        }
+        query = f"Upgrade customer {cid} to tier {tier} by account rep {rep}. Justification: {reason}."
+        samples.append(("update_customer_tier", query, args))
+
+    # 10. schedule_webhook
+    events = ["invoice.paid", "order.created", "ticket.resolved", "refund.processed"]
+    for i in range(count_per_endpoint):
+        dest = f"https://api.partner{random.randint(10, 99)}.com/webhooks/v1"
+        sub_events = random.sample(events, random.randint(1, 3))
+        secret = f"whsec_{random.randint(10000000, 99999999)}"
+        args = {
+            "destination_url": dest,
+            "subscribed_events": sub_events,
+            "retry_count": 3,
+            "signing_secret": secret,
+            "headers": {"X-Client-ID": "partner_app", "Content-Type": "application/json"},
+        }
+        query = f"Register webhook destination {dest} subscribed to events {sub_events} with signing secret {secret}."
+        samples.append(("schedule_webhook", query, args))
+
+    return samples
+
+
+def generate_training_data(total_samples: int = 2000) -> List[Dict[str, Any]]:
+    """Generates 2,000 SFT training records across the 10 training endpoints."""
+    raw = []
+    raw.extend(generate_finance_samples(200))
+    raw.extend(generate_commerce_samples(200))
+    raw.extend(generate_crm_samples(200))
+
+    assert len(raw) == total_samples, f"Expected {total_samples}, got {len(raw)}"
+    validator = ExecutionValidator()
+    train_records = []
+
+    for idx, (fn, query, args) in enumerate(raw):
+        # Verify ground truth strictly passes sandbox validation
+        res = validator.validate_call({"name": fn, "arguments": args}, expected_func=fn)
+        assert res.status == "passed", f"Ground truth failed for {fn}: {res.error_message}"
+
+        # Sample candidate tools: target + 5 decoys from the other 9 training endpoints
+        candidate_tools = sample_candidate_tools(fn, TRAIN_ENDPOINTS, total_count=6, seed=idx + 100)
+        prompt = build_tool_calling_prompt(query, candidate_tools)
+        response_str = json.dumps({"name": fn, "arguments": args})
+
+        train_records.append({
+            "id": f"train_sft_{idx:04d}",
+            "domain": ENDPOINT_REGISTRY[fn]["domain"],
+            "query": query,
+            "target_function": fn,
             "target_arguments": args,
+            "candidate_tools": candidate_tools,
+            "prompt": prompt,
+            "response": response_str,
+            "text": f"{prompt}{response_str}<|im_end|>",
         })
 
-    assert len(unseen_data) == 500, f"Expected exactly M=500 unseen requests, got {len(unseen_data)}"
-    return unseen_data
+    return train_records
+
+
+# ============================================================================
+# TEMPLATE GENERATORS FOR 6 UNSEEN TEST APIS (Infra & Travel)
+# ============================================================================
+
+def generate_unseen_eval_data(total_samples: int = 500) -> List[Dict[str, Any]]:
+    """
+    Generates M=500 requests across the 6 unseen Infrastructure & Travel endpoints.
+    Every single prompt includes all 6 unseen endpoints (shuffled).
+    """
+    validator = ExecutionValidator()
+    raw_eval = []
+
+    instance_tiers = ["c6i.xlarge", "c6i.2xlarge", "g5.xlarge", "m6i.4xlarge"]
+    regions = ["us-east-1", "us-west-2", "eu-central-1", "ap-southeast-1"]
+    envs = ["DEVELOPMENT", "STAGING", "PRODUCTION"]
+    
+    strategies = ["IMMEDIATE", "DRAIN_GRADUAL", "SURGE_FIRST"]
+    cred_types = ["OAUTH2_KEY", "SSH_RSA", "X509_CERTIFICATE", "API_TOKEN"]
+    cabin_classes = ["ECONOMY", "PREMIUM_ECONOMY", "BUSINESS", "FIRST"]
+    room_categories = ["STANDARD_KING", "EXECUTIVE_SUITE", "DOUBLE_QUEEN", "PRESIDENTIAL"]
+    cancel_reasons = ["CLIENT_RESCHEDULE", "WEATHER_DISRUPTION", "MEETING_CANCELLED", "DUPLICATE_BOOKING"]
+    airports = ["JFK", "LHR", "HND", "SFO", "ORD", "FRA", "SIN", "CDG"]
+
+    count_per_ep = total_samples // len(UNSEEN_ENDPOINTS)  # 83 each
+    remainder = total_samples % len(UNSEEN_ENDPOINTS)       # 2 left
+
+    for ep_idx, fn in enumerate(UNSEEN_ENDPOINTS):
+        n_items = count_per_ep + (1 if ep_idx < remainder else 0)
+        for i in range(n_items):
+            if fn == "provision_compute_node":
+                tier = random.choice(instance_tiers)
+                reg = random.choice(regions)
+                cnt = random.randint(1, 20)
+                env = random.choice(envs)
+                tags = {"owner": f"team_{random.choice(['infra', 'core', 'platform'])}", "cost_center": f"cc_{random.randint(100, 999)}"}
+                args = {
+                    "instance_tier": tier,
+                    "cloud_region": reg,
+                    "cluster_count": cnt,
+                    "environment_tag": env,
+                    "resource_tags": tags,
+                }
+                query = f"Provision {cnt} compute nodes of tier {tier} in region {reg} for {env} environment. Tag owner as {tags['owner']}."
+
+            elif fn == "scale_kubernetes_cluster":
+                cl_name = f"k8s-prod-{random.randint(100, 999)}"
+                pool = random.choice(["worker-pool", "gpu-pool", "compute-nodes"])
+                rep = random.randint(3, 40)
+                strat = random.choice(strategies)
+                args = {
+                    "cluster_name": cl_name,
+                    "node_pool": pool,
+                    "desired_replicas": rep,
+                    "scaling_strategy": strat,
+                    "autoscale_config": {"min_nodes": 2, "max_nodes": 60},
+                }
+                query = f"Scale node pool '{pool}' in cluster {cl_name} to {rep} desired replicas using {strat} strategy with min_nodes=2 and max_nodes=60."
+
+            elif fn == "rotate_iam_credentials":
+                sa = f"sa-{random.choice(['data', 'api', 'etl'])}{random.randint(1000, 9999)}"
+                ctype = random.choice(cred_types)
+                grace = random.choice([24, 48, 72])
+                args = {
+                    "service_account_id": sa,
+                    "credential_type": ctype,
+                    "grace_period_hours": grace,
+                    "notify_emails": [f"security-alerts@company{random.randint(1, 9)}.com"],
+                    "force_revocation": False,
+                }
+                query = f"Rotate {ctype} credentials for service account {sa} with a {grace}-hour grace period and alert security team."
+
+            elif fn == "search_multi_leg_flights":
+                orig, mid, dest = random.sample(airports, 3)
+                cab = random.choice(cabin_classes)
+                pax = random.randint(1, 4)
+                d1 = f"2026-11-{random.randint(10, 15):02d}"
+                d2 = f"2026-11-{random.randint(18, 24):02d}"
+                args = {
+                    "itinerary_segments": [
+                        {"departure_airport": orig, "arrival_airport": mid, "flight_date": d1},
+                        {"departure_airport": mid, "arrival_airport": dest, "flight_date": d2},
+                    ],
+                    "cabin_class": cab,
+                    "passenger_count": pax,
+                    "flexible_dates": True,
+                    "preferred_alliances": ["STAR_ALLIANCE"],
+                }
+                query = f"Search multi-leg flights: {orig} to {mid} on {d1}, then {mid} to {dest} on {d2} in {cab} class for {pax} passengers."
+
+            elif fn == "reserve_corporate_hotel":
+                prop = f"HTL-{random.choice(['NY', 'SF', 'LN', 'TK'])}-{random.randint(1000, 9999)}"
+                cin = f"2026-12-{random.randint(5, 12):02d}"
+                cout = f"2026-12-{random.randint(15, 20):02d}"
+                room = random.choice(room_categories)
+                corp = f"CORP-{random.randint(10000, 99999)}"
+                manifest = [{"first_name": "Alex", "last_name": f"Smith_{i}"}]
+                args = {
+                    "property_code": prop,
+                    "check_in_date": cin,
+                    "check_out_date": cout,
+                    "room_category": room,
+                    "corporate_billing_code": corp,
+                    "guest_manifest": manifest,
+                }
+                query = f"Reserve a {room} room at {prop} checking in {cin} and checking out {cout} for {manifest[0]['first_name']} {manifest[0]['last_name']}. Bill to {corp}."
+
+            else:  # cancel_itinerary_segment
+                pnr = f"PNR-{random.randint(100000, 999999)}"
+                seg = f"seg_{random.randint(10, 99)}"
+                rsn = random.choice(cancel_reasons)
+                notes = f"Cancellation authorized per travel policy exemption #{random.randint(100, 999)}"
+                args = {
+                    "booking_reference": pnr,
+                    "segment_id": seg,
+                    "cancellation_reason": rsn,
+                    "request_credit_voucher": True,
+                    "refund_override_notes": notes,
+                }
+                query = f"Cancel segment {seg} on booking {pnr} due to {rsn.replace('_', ' ').lower()}. Request credit voucher. Notes: {notes}."
+
+            raw_eval.append((fn, query, args))
+
+    assert len(raw_eval) == total_samples, f"Expected exactly {total_samples}, got {len(raw_eval)}"
+    eval_records = []
+
+    for idx, (fn, query, args) in enumerate(raw_eval):
+        # 1. Verify ground-truth call strictly passes sandbox validation
+        res = validator.validate_call({"name": fn, "arguments": args}, expected_func=fn)
+        assert res.status == "passed", f"Ground truth eval call failed for {fn}: {res.error_message}"
+
+        # 2. Candidate tools: ALL 6 unseen endpoints (shuffled deterministically)
+        candidate_tools = sample_candidate_tools(fn, UNSEEN_ENDPOINTS, total_count=6, seed=idx + 500)
+        prompt = build_tool_calling_prompt(query, candidate_tools)
+
+        eval_records.append({
+            "id": f"eval_unseen_{idx:03d}",
+            "domain": ENDPOINT_REGISTRY[fn]["domain"],
+            "query": query,
+            "target_function": fn,
+            "target_arguments": args,
+            "candidate_tools": candidate_tools,
+            "prompt": prompt,
+        })
+
+    return eval_records
 
 
 def generate_bfcl_subset(num_samples: int = 200) -> List[Dict[str, Any]]:
-    """Generates decontaminated subset of Berkeley Function Calling Leaderboard tasks."""
+    """Generates decontaminated subset of general function calling requests."""
     bfcl_data = []
     categories = ["math_calculator", "weather_query", "calendar_scheduler", "unit_converter"]
-    
     cities = ["New York", "London", "Tokyo", "Paris", "Sydney", "Berlin", "Toronto", "Singapore"]
-    units = [("km", "miles"), ("celsius", "fahrenheit"), ("kg", "pounds"), ("liters", "gallons")]
 
     for i in range(num_samples):
         cat = categories[i % len(categories)]
@@ -371,30 +481,84 @@ def generate_bfcl_subset(num_samples: int = 200) -> List[Dict[str, Any]]:
             q = f"Calculate the result of {a} {op} {b}."
             target = "calculate"
             args = {"operation": op, "a": float(a), "b": float(b)}
+            tools = [{
+                "name": "calculate",
+                "description": "Perform basic arithmetic calculations.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "operation": {"type": "string", "enum": ["add", "multiply", "subtract"]},
+                        "a": {"type": "number"},
+                        "b": {"type": "number"},
+                    },
+                    "required": ["operation", "a", "b"],
+                }
+            }]
         elif cat == "weather_query":
             city = random.choice(cities)
             q = f"What is the current weather forecast for {city}?"
             target = "get_current_weather"
             args = {"location": city, "unit": "metric"}
+            tools = [{
+                "name": "get_current_weather",
+                "description": "Fetch real-time weather observations for a city.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string"},
+                        "unit": {"type": "string", "enum": ["metric", "imperial"]},
+                    },
+                    "required": ["location"],
+                }
+            }]
         elif cat == "calendar_scheduler":
             day = random.randint(1, 28)
             time_str = f"{random.randint(9, 17):02d}:00"
             q = f"Schedule a calendar event titled 'Team Sync' on 2026-11-{day:02d} at {time_str}."
             target = "create_calendar_event"
             args = {"title": "Team Sync", "date": f"2026-11-{day:02d}", "time": time_str}
+            tools = [{
+                "name": "create_calendar_event",
+                "description": "Add an appointment or sync event to user calendar.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "date": {"type": "string"},
+                        "time": {"type": "string"},
+                    },
+                    "required": ["title", "date", "time"],
+                }
+            }]
         else:
-            u_from, u_to = random.choice(units)
             val = random.randint(5, 100)
+            u_from, u_to = random.choice([("km", "miles"), ("celsius", "fahrenheit"), ("kg", "pounds")])
             q = f"Convert {val} {u_from} to {u_to}."
             target = "convert_units"
             args = {"value": float(val), "from_unit": u_from, "to_unit": u_to}
+            tools = [{
+                "name": "convert_units",
+                "description": "Convert physical quantities between measurement units.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "value": {"type": "number"},
+                        "from_unit": {"type": "string"},
+                        "to_unit": {"type": "string"},
+                    },
+                    "required": ["value", "from_unit", "to_unit"],
+                }
+            }]
 
+        prompt = build_tool_calling_prompt(q, tools)
         bfcl_data.append({
             "id": f"eval_bfcl_{i:03d}",
             "domain": "bfcl_standard",
             "query": q,
             "target_function": target,
             "target_arguments": args,
+            "candidate_tools": tools,
+            "prompt": prompt,
         })
 
     return bfcl_data
@@ -415,10 +579,10 @@ def run_pipeline():
     print("=" * 70)
 
     # 1. Generate Datasets
-    print("[*] Generating training set (Finance & Commerce domains)...")
-    train_data = generate_training_data(2500)
+    print("[*] Generating SFT training set (N=2,000 across 10 Finance/Commerce/CRM endpoints)...")
+    train_data = generate_training_data(2000)
 
-    print("[*] Generating frozen unseen eval set (M=500: Infra & Travel domains)...")
+    print("[*] Generating frozen unseen eval set (M=500 across 6 Infra/Travel endpoints)...")
     eval_unseen = generate_unseen_eval_data(500)
 
     print("[*] Generating decontaminated BFCL evaluation subset (200 requests)...")
@@ -436,11 +600,9 @@ def run_pipeline():
     unseen_queries = set(d["query"].strip().lower() for d in eval_unseen)
     bfcl_queries = set(d["query"].strip().lower() for d in eval_bfcl)
 
-    unseen_prompt_overlap = train_queries.intersection(unseen_queries)
-    bfcl_prompt_overlap = train_queries.intersection(bfcl_queries)
-    assert len(unseen_prompt_overlap) == 0, "Decontamination failure! Unseen queries overlap with train."
-    assert len(bfcl_prompt_overlap) == 0, "Decontamination failure! BFCL queries overlap with train."
-    print("    -> Prompt overlap with Train: ZERO for both Unseen Eval and BFCL.")
+    assert len(train_queries.intersection(unseen_queries)) == 0, "Query overlap detected between train and unseen!"
+    assert len(train_queries.intersection(bfcl_queries)) == 0, "Query overlap detected between train and BFCL!"
+    print("    -> Query overlap: ZERO across all splits.")
 
     # 3. Save Files
     train_file = DATA_DIR / "train_sft.jsonl"
@@ -464,10 +626,12 @@ def run_pipeline():
     # 4. Generate SHA-256 Manifest
     manifest = {
         "dataset_metadata": {
-            "created_at": "2026-10-18T00:00:00Z",
+            "created_at": "2026-10-21T00:00:00Z",
             "seed": SEED,
             "train_domains": list(train_domains),
             "unseen_eval_domains": list(unseen_domains),
+            "train_endpoints": TRAIN_ENDPOINTS,
+            "unseen_endpoints": UNSEEN_ENDPOINTS,
             "unseen_eval_count": len(eval_unseen),
             "bfcl_eval_count": len(eval_bfcl),
             "train_count": len(train_data),
@@ -494,7 +658,7 @@ def run_pipeline():
 
     print(f"[+] Created test manifest: {manifest_file.name}")
     print(f"    eval_unseen_apis.jsonl SHA-256: {manifest['file_hashes']['eval_unseen_apis.jsonl']['sha256']}")
-    print(f"    eval_bfcl_subset.jsonl SHA-256: {manifest['file_hashes']['eval_bfcl_subset.jsonl']['sha256']}")
+    print(f"    train_sft.jsonl SHA-256:        {manifest['file_hashes']['train_sft.jsonl']['sha256']}")
     print("=" * 70)
 
 

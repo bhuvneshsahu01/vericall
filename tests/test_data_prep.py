@@ -28,6 +28,11 @@ def test_eval_unseen_apis_has_exactly_500_samples():
 
     records = [json.loads(line) for line in open(path, "r", encoding="utf-8") if line.strip()]
     assert len(records) == 500, f"Expected exactly M=500 unseen API eval samples, found {len(records)}"
+    
+    # Confirm candidate_tools has 6 schemas in each prompt
+    for r in records[:10]:
+        assert len(r["candidate_tools"]) == 6
+        assert "Available Tools:" in r["prompt"]
 
 
 def test_eval_bfcl_subset_has_200_samples():
@@ -55,8 +60,8 @@ def test_zero_domain_overlap_between_train_and_unseen_eval():
                 unseen_domains.add(json.loads(line)["domain"])
 
     overlap = train_domains.intersection(unseen_domains)
-    assert len(overlap) == 0, f"Domain contamination detected: {overlap}"
-    assert train_domains == {"finance", "commerce"}
+    assert len(overlap) == 0, f"Contamination detected! Overlapping domains: {overlap}"
+    assert train_domains == {"finance", "commerce", "crm"}
     assert unseen_domains == {"infra", "travel"}
 
 
@@ -65,26 +70,23 @@ def test_zero_prompt_overlap_between_train_and_eval_sets():
     unseen_path = DATA_DIR / "eval_unseen_apis.jsonl"
     bfcl_path = DATA_DIR / "eval_bfcl_subset.jsonl"
 
-    train_queries = set()
+    train_prompts = set()
     with open(train_path, "r", encoding="utf-8") as f:
         for line in f:
             if line.strip():
-                train_queries.add(json.loads(line)["query"].strip().lower())
+                train_prompts.add(json.loads(line)["query"].strip().lower())
 
-    unseen_queries = set()
     with open(unseen_path, "r", encoding="utf-8") as f:
         for line in f:
             if line.strip():
-                unseen_queries.add(json.loads(line)["query"].strip().lower())
+                q = json.loads(line)["query"].strip().lower()
+                assert q not in train_prompts, f"Contaminated query found: {q}"
 
-    bfcl_queries = set()
     with open(bfcl_path, "r", encoding="utf-8") as f:
         for line in f:
             if line.strip():
-                bfcl_queries.add(json.loads(line)["query"].strip().lower())
-
-    assert len(train_queries.intersection(unseen_queries)) == 0, "Prompt overlap between train and unseen eval"
-    assert len(train_queries.intersection(bfcl_queries)) == 0, "Prompt overlap between train and BFCL eval"
+                q = json.loads(line)["query"].strip().lower()
+                assert q not in train_prompts, f"Contaminated BFCL query found: {q}"
 
 
 def test_manifest_sha256_hashes_match_disk():
@@ -94,7 +96,8 @@ def test_manifest_sha256_hashes_match_disk():
     with open(manifest_path, "r", encoding="utf-8") as f:
         manifest = json.load(f)
 
-    for file_key in ["eval_unseen_apis.jsonl", "eval_bfcl_subset.jsonl"]:
-        expected_hash = manifest["file_hashes"][file_key]["sha256"]
-        actual_hash = compute_file_sha256(DATA_DIR / file_key)
-        assert actual_hash == expected_hash, f"SHA-256 hash mismatch for {file_key}"
+    for filename, meta in manifest["file_hashes"].items():
+        filepath = DATA_DIR / filename
+        assert filepath.exists(), f"File {filename} in manifest does not exist"
+        computed = compute_file_sha256(filepath)
+        assert computed == meta["sha256"], f"Hash mismatch for {filename}: {computed} vs {meta['sha256']}"

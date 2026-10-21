@@ -1,10 +1,12 @@
 """
 vericall/train/train_sft.py
 ---------------------------
-QLoRA Supervised Fine-Tuning (SFT) for Tool Calling.
-Supports fast 4-bit unsloth patching with graceful HuggingFace PEFT fallback.
+QLoRA Supervised Fine-Tuning (SFT) for Tool Calling with Completion-Only Loss Masking.
+Uses DataCollatorForCompletionOnlyLM on "<|im_start|>assistant\n" so the model only
+learns to predict the tool call JSON, not the in-context tool schemas.
 """
 
+import inspect
 import json
 import logging
 import os
@@ -16,34 +18,26 @@ logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = REPO_ROOT / "data"
-OUTPUT_DIR = REPO_ROOT / "checkpoints" / "vericall-sft-lora"
-
-TOOL_SYSTEM_PROMPT = """You are a precise, tool-calling assistant. Given the user's request and available tools, produce a JSON object representing the exact tool call with the required parameters.
-
-Output format:
-{"name": "<function_name>", "arguments": {<key_value_pairs>}}
-"""
-
-
-def format_sft_prompt(query: str, target_fn: str, target_args: Dict[str, Any]) -> str:
-    """Formats an instruction, query, and expected tool call response."""
-    response = json.dumps({"name": target_fn, "arguments": target_args})
-    return f"<|im_start|>system\n{TOOL_SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n{response}<|im_end|>"
+OUTPUT_DIR = REPO_ROOT / "checkpoints" / "sft_adapter"
 
 
 def load_sft_dataset(data_path: Optional[Path] = None) -> List[Dict[str, str]]:
-    """Loads and formats the SFT dataset from JSONL."""
+    """Loads SFT training records formatted with candidate schemas."""
     path = data_path or (DATA_DIR / "train_sft.jsonl")
     if not path.exists():
-        raise FileNotFoundError(f"SFT dataset not found at {path}. Run vericall.data.prep first.")
+        from vericall.data.prep import run_pipeline
+        run_pipeline()
 
     dataset = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             if line.strip():
                 record = json.loads(line)
-                text = format_sft_prompt(record["query"], record["target_function"], record["target_arguments"])
-                dataset.append({"text": text})
+                dataset.append({
+                    "text": record["text"],
+                    "prompt": record["prompt"],
+                    "response": record["response"],
+                })
 
     logger.info(f"Loaded {len(dataset)} SFT training examples from {path.name}")
     return dataset
@@ -51,7 +45,7 @@ def load_sft_dataset(data_path: Optional[Path] = None) -> List[Dict[str, str]]:
 
 def run_sft_training(
     model_name: str = "unsloth/Qwen2.5-7B-Instruct",
-    max_seq_length: int = 2048,
+    max_seq_length: int = 1536,
     load_in_4bit: bool = True,
     lora_r: int = 16,
     lora_alpha: int = 32,
@@ -64,15 +58,17 @@ def run_sft_training(
 ) -> str:
     """
     Executes QLoRA SFT training using Unsloth (if available) or HuggingFace PEFT.
+    Enforces completion-only loss masking on "<|im_start|>assistant\n".
     """
     save_path = output_dir or OUTPUT_DIR
     save_path.mkdir(parents=True, exist_ok=True)
 
     try:
         from unsloth import FastLanguageModel
-        from trl import SFTTrainer
+        from trl import SFTTrainer, DataCollatorForCompletionOnlyLM
         from transformers import TrainingArguments
         from datasets import Dataset
+        import torch
 
         logger.info(f"Using unsloth FastLanguageModel for fast 4-bit QLoRA on {model_name}...")
         model, tokenizer = FastLanguageModel.from_pretrained(
@@ -94,76 +90,61 @@ def run_sft_training(
         raw_data = load_sft_dataset()
         train_dataset = Dataset.from_list(raw_data)
 
-        import inspect
-        import torch
+        # Completion-only loss masking
+        response_template = "<|im_start|>assistant\n"
+        collator = DataCollatorForCompletionOnlyLM(response_template=response_template, tokenizer=tokenizer)
 
-        try:
-            from trl import SFTConfig
-            HAS_SFT_CONFIG = True
-        except ImportError:
-            HAS_SFT_CONFIG = False
-
-        class SafeSFTTrainer(SFTTrainer):
-            def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-                kwargs = {}
-                if num_items_in_batch is not None:
-                    kwargs["num_items_in_batch"] = num_items_in_batch
-                return super(SFTTrainer, self).compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
-
-        # Cast trainable parameters to float32
         for p in model.parameters():
             if p.requires_grad:
                 p.data = p.data.to(torch.float32)
 
-        common_args = {
-            "output_dir": str(save_path / "runs"),
-            "per_device_train_batch_size": batch_size,
-            "gradient_accumulation_steps": gradient_accumulation_steps,
-            "warmup_steps": 10,
-            "num_train_epochs": num_train_epochs,
-            "learning_rate": learning_rate,
-            "fp16": False,
-            "bf16": False,
-            "logging_steps": 10,
-            "optim": "adamw_torch",
-            "weight_decay": 0.01,
-            "lr_scheduler_type": "cosine",
-            "seed": 42,
-            "report_to": "none",
-        }
+        try:
+            from trl import SFTConfig
+            training_args = SFTConfig(
+                output_dir=str(save_path / "runs"),
+                per_device_train_batch_size=batch_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                warmup_steps=10,
+                num_train_epochs=num_train_epochs,
+                learning_rate=learning_rate,
+                fp16=False,
+                bf16=False,
+                logging_steps=10,
+                optim="adamw_torch",
+                weight_decay=0.01,
+                lr_scheduler_type="cosine",
+                seed=42,
+                report_to="none",
+                max_length=max_seq_length,
+                dataset_text_field="text",
+            )
+        except ImportError:
+            training_args = TrainingArguments(
+                output_dir=str(save_path / "runs"),
+                per_device_train_batch_size=batch_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                warmup_steps=10,
+                num_train_epochs=num_train_epochs,
+                learning_rate=learning_rate,
+                fp16=False,
+                bf16=False,
+                logging_steps=10,
+                optim="adamw_torch",
+                weight_decay=0.01,
+                lr_scheduler_type="cosine",
+                seed=42,
+                report_to="none",
+            )
 
-        sft_kwargs = {
-            "model": model,
-            "train_dataset": train_dataset,
-        }
+        trainer = SFTTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            tokenizer=tokenizer,
+            data_collator=collator,
+        )
 
-        if HAS_SFT_CONFIG:
-            sft_cfg_params = inspect.signature(SFTConfig.__init__).parameters
-            cfg_kwargs = dict(common_args)
-            if "dataset_text_field" in sft_cfg_params:
-                cfg_kwargs["dataset_text_field"] = "text"
-            if "max_length" in sft_cfg_params:
-                cfg_kwargs["max_length"] = max_seq_length
-            elif "max_seq_length" in sft_cfg_params:
-                cfg_kwargs["max_seq_length"] = max_seq_length
-            training_args = SFTConfig(**cfg_kwargs)
-        else:
-            training_args = TrainingArguments(**common_args)
-            sft_kwargs["dataset_text_field"] = "text"
-
-        sft_kwargs["args"] = training_args
-
-        sig = inspect.signature(SFTTrainer.__init__).parameters
-        if "processing_class" in sig:
-            sft_kwargs["processing_class"] = tokenizer
-        else:
-            sft_kwargs["tokenizer"] = tokenizer
-        if "max_seq_length" in sig and not HAS_SFT_CONFIG:
-            sft_kwargs["max_seq_length"] = max_seq_length
-
-        trainer = SafeSFTTrainer(**sft_kwargs)
-
-        logger.info("Starting SFT training...")
+        logger.info("Starting SFT training with completion-only loss masking...")
         trainer.train()
 
         logger.info(f"Saving SFT LoRA adapters to {save_path}...")
@@ -173,7 +154,6 @@ def run_sft_training(
 
     except ImportError as e:
         logger.warning(f"Unsloth or GPU dependencies not present in current environment ({e}).")
-        logger.info("Generating standalone training configuration and command for GPU/Colab execution.")
         config = {
             "model_name": model_name,
             "lora_r": lora_r,
@@ -187,15 +167,6 @@ def run_sft_training(
         with open(save_path / "sft_config.json", "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
         return str(save_path)
-
-
-def is_bfloat16_supported() -> bool:
-    """Checks if bfloat16 is supported on the active CUDA device."""
-    try:
-        import torch
-        return torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    except Exception:
-        return False
 
 
 if __name__ == "__main__":
