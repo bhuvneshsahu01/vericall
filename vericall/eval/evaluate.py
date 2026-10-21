@@ -66,7 +66,7 @@ def evaluate_predictions(
 
         eval_details.append({
             "id": gt.get("id", f"sample_{idx}"),
-            "query": gt["query"],
+            "query": gt.get("query", ""),
             "expected_func": expected_fn,
             "predicted_func": res.function_name,
             "validation_status": res.status,

@@ -125,6 +125,13 @@ def mine_dpo_pairs(num_pairs: int = 1000) -> List[Dict[str, Any]]:
     - 200 (20%) missing_arg
     - 100 (10%) wrong_endpoint
     """
+    out_file = DATA_DIR / "train_dpo.jsonl"
+    if out_file.exists():
+        existing = [json.loads(line) for line in open(out_file, "r", encoding="utf-8") if line.strip()]
+        if len(existing) >= num_pairs:
+            print(f"[+] Loaded {len(existing[:num_pairs])} existing execution-verified DPO pairs from {out_file.name}")
+            return existing[:num_pairs]
+
     train_file = DATA_DIR / "train_sft.jsonl"
     if not train_file.exists():
         from .prep import run_pipeline
