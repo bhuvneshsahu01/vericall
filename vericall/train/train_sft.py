@@ -43,6 +43,38 @@ def load_sft_dataset(data_path: Optional[Path] = None) -> List[Dict[str, str]]:
     return dataset
 
 
+
+def _get_completion_collator(response_template, tokenizer):
+    try:
+        from trl import DataCollatorForCompletionOnlyLM
+        return DataCollatorForCompletionOnlyLM(response_template=response_template, tokenizer=tokenizer)
+    except (ImportError, AttributeError):
+        class SafeCompletionCollator:
+            def __init__(self, resp_tpl, tok):
+                self.tok = tok
+                self.resp_tpl = resp_tpl
+                self.resp_ids = tok.encode(resp_tpl, add_special_tokens=False)
+
+            def __call__(self, examples):
+                texts = [e["text"] for e in examples]
+                batch = self.tok(texts, padding=True, truncation=True, max_length=1536, return_tensors="pt")
+                labels = batch["input_ids"].clone()
+                n = len(self.resp_ids)
+                for i in range(labels.shape[0]):
+                    ids = batch["input_ids"][i].tolist()
+                    found = -1
+                    for j in range(len(ids) - n + 1):
+                        if ids[j:j+n] == self.resp_ids:
+                            found = j + n
+                            break
+                    if found != -1:
+                        labels[i, :found] = -100
+                    else:
+                        labels[i, :] = -100
+                batch["labels"] = labels
+                return batch
+        return SafeCompletionCollator(response_template, tokenizer)
+
 def run_sft_training(
     model_name: str = "unsloth/Qwen2.5-7B-Instruct",
     max_seq_length: int = 1536,
@@ -65,7 +97,7 @@ def run_sft_training(
 
     try:
         from unsloth import FastLanguageModel
-        from trl import SFTTrainer, DataCollatorForCompletionOnlyLM
+        from trl import SFTTrainer
         from transformers import TrainingArguments
         from datasets import Dataset
         import torch
@@ -92,7 +124,7 @@ def run_sft_training(
 
         # Completion-only loss masking
         response_template = "<|im_start|>assistant\n"
-        collator = DataCollatorForCompletionOnlyLM(response_template=response_template, tokenizer=tokenizer)
+        collator = _get_completion_collator(response_template=response_template, tokenizer=tokenizer)
 
         for p in model.parameters():
             if p.requires_grad:
