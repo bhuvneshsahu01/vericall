@@ -77,18 +77,40 @@ class ExecutionValidator:
         func_name = ""
         arguments: Any = {}
 
-        # 1. Parse JSON / Structure Check
+        # 1. Parse JSON / Structure Check (with markdown fence & regex recovery)
         if isinstance(raw_prediction, str):
+            clean_str = raw_prediction.strip()
+            if clean_str.startswith("```json"):
+                clean_str = clean_str[7:].strip()
+            elif clean_str.startswith("```"):
+                clean_str = clean_str[3:].strip()
+            if clean_str.endswith("```"):
+                clean_str = clean_str[:-3].strip()
+
             try:
-                parsed = json.loads(raw_prediction)
-            except Exception as e:
-                return ValidationResult(
-                    status="invalid_json",
-                    is_success=False,
-                    function_name="",
-                    arguments={},
-                    error_message=f"Malformed JSON: {str(e)}",
-                )
+                parsed = json.loads(clean_str)
+            except Exception:
+                import re
+                match = re.search(r"\{.*\}", clean_str, re.DOTALL)
+                if match:
+                    try:
+                        parsed = json.loads(match.group(0))
+                    except Exception as e:
+                        return ValidationResult(
+                            status="invalid_json",
+                            is_success=False,
+                            function_name="",
+                            arguments={},
+                            error_message=f"Malformed JSON: {str(e)}",
+                        )
+                else:
+                    return ValidationResult(
+                        status="invalid_json",
+                        is_success=False,
+                        function_name="",
+                        arguments={},
+                        error_message="No JSON object found in prediction",
+                    )
         elif isinstance(raw_prediction, dict):
             parsed = raw_prediction
         else:

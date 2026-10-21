@@ -149,6 +149,7 @@ def run_sft_training(
                 report_to="none",
                 max_length=max_seq_length,
                 dataset_text_field="text",
+                save_strategy="no",
             )
         except ImportError:
             training_args = TrainingArguments(
@@ -166,6 +167,7 @@ def run_sft_training(
                 lr_scheduler_type="cosine",
                 seed=42,
                 report_to="none",
+                save_strategy="no",
             )
 
         trainer = SFTTrainer(

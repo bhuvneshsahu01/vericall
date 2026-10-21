@@ -90,6 +90,8 @@ def run_dpo_training(
             "fp16": False,
             "bf16": False,
             "report_to": "none",
+            "save_strategy": "no",
+            "remove_unused_columns": False,
             "max_length": max_length,
             "max_prompt_length": max_prompt_length,
         }
