@@ -77,6 +77,16 @@ def main():
     print(">>> VERICALL BENCHMARK RESULTS (M=500 UNSEEN APIS)")
     print("================================================================================")
     print(format_markdown_table(data))
+
+    if "bfcl_base_acc_pct" in data or "bfcl_dpo_acc_pct" in data:
+        base_b = data.get("bfcl_base_acc_pct", "N/A")
+        sft_b = data.get("bfcl_sft_acc_pct", "N/A")
+        dpo_b = data.get("bfcl_dpo_acc_pct", "N/A")
+        print("\n================================================================================")
+        print(">>> BFCL AST SUBSET BENCHMARK (N=200)")
+        print("================================================================================")
+        print(f"| Base Model: {base_b}% | SFT-Only: {sft_b}% | VeriCall (DPO): {dpo_b}% |")
+
     print("\n================================================================================")
     print(">>> LATEX CV SNIPPET")
     print("================================================================================")

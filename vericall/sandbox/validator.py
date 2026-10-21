@@ -150,13 +150,15 @@ class ExecutionValidator:
             )
 
         # 2. Endpoint Existence & Selection Check
-        if func_name not in self.registry:
+        cand_map = {t["name"]: t for t in (candidate_tools or [])}
+
+        if func_name not in self.registry and func_name not in cand_map:
             return ValidationResult(
                 status="wrong_endpoint",
                 is_success=False,
                 function_name=func_name,
                 arguments=arguments,
-                error_message=f"Tool '{func_name}' is not in the allowed API schema registry.",
+                error_message=f"Tool '{func_name}' is not in the allowed API schema registry or candidate tools.",
             )
 
         if expected_func and func_name != expected_func:
@@ -166,6 +168,106 @@ class ExecutionValidator:
                 function_name=func_name,
                 arguments=arguments,
                 error_message=f"Selected wrong endpoint '{func_name}' (expected '{expected_func}').",
+            )
+
+        # Dynamic JSON Schema / AST validation for tools not in FastAPI sandbox (e.g. BFCL)
+        if func_name not in self.registry and func_name in cand_map:
+            tool_spec = cand_map[func_name]
+            params = tool_spec.get("parameters", {})
+            properties = params.get("properties", {})
+            required = params.get("required", [])
+
+            extra_fields = set(arguments.keys()) - set(properties.keys())
+            if extra_fields:
+                first_extra = sorted(list(extra_fields))[0]
+                return ValidationResult(
+                    status="hallucinated_arg",
+                    is_success=False,
+                    function_name=func_name,
+                    arguments=arguments,
+                    error_message=f"Hallucinated argument '{first_extra}' not present in {func_name} schema.",
+                    error_field=first_extra,
+                )
+
+            missing = [r for r in required if r not in arguments]
+            if missing:
+                first_missing = sorted(missing)[0]
+                return ValidationResult(
+                    status="missing_arg",
+                    is_success=False,
+                    function_name=func_name,
+                    arguments=arguments,
+                    error_message=f"Missing required parameter '{first_missing}' in call to {func_name}.",
+                    error_field=first_missing,
+                )
+
+            for field, val in arguments.items():
+                if field not in properties:
+                    continue
+                prop_spec = properties[field]
+                exp_type = prop_spec.get("type")
+                if exp_type == "number" and not isinstance(val, (int, float)):
+                    return ValidationResult(
+                        status="type_error",
+                        is_success=False,
+                        function_name=func_name,
+                        arguments=arguments,
+                        error_message=f"Type error: parameter '{field}' expected number, got {type(val).__name__}.",
+                        error_field=field,
+                    )
+                elif exp_type == "integer" and not (isinstance(val, int) and not isinstance(val, bool)):
+                    return ValidationResult(
+                        status="type_error",
+                        is_success=False,
+                        function_name=func_name,
+                        arguments=arguments,
+                        error_message=f"Type error: parameter '{field}' expected integer, got {type(val).__name__}.",
+                        error_field=field,
+                    )
+                elif exp_type == "string" and not isinstance(val, str):
+                    return ValidationResult(
+                        status="type_error",
+                        is_success=False,
+                        function_name=func_name,
+                        arguments=arguments,
+                        error_message=f"Type error: parameter '{field}' expected string, got {type(val).__name__}.",
+                        error_field=field,
+                    )
+                elif exp_type == "boolean" and not isinstance(val, bool):
+                    return ValidationResult(
+                        status="type_error",
+                        is_success=False,
+                        function_name=func_name,
+                        arguments=arguments,
+                        error_message=f"Type error: parameter '{field}' expected boolean, got {type(val).__name__}.",
+                        error_field=field,
+                    )
+                elif exp_type == "array" and not isinstance(val, list):
+                    return ValidationResult(
+                        status="type_error",
+                        is_success=False,
+                        function_name=func_name,
+                        arguments=arguments,
+                        error_message=f"Type error: parameter '{field}' expected array, got {type(val).__name__}.",
+                        error_field=field,
+                    )
+
+                if "enum" in prop_spec and val not in prop_spec.get("enum", []):
+                    return ValidationResult(
+                        status="type_error",
+                        is_success=False,
+                        function_name=func_name,
+                        arguments=arguments,
+                        error_message=f"Value '{val}' for parameter '{field}' not in enum options.",
+                        error_field=field,
+                    )
+
+            return ValidationResult(
+                status="passed",
+                is_success=True,
+                function_name=func_name,
+                arguments=arguments,
+                execution_response={"status": "ast_validated", "tool": func_name},
             )
 
         spec = self.registry[func_name]

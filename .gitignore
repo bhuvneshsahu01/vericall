@@ -53,3 +53,8 @@ lora_output/
 # OS specific
 .DS_Store
 Thumbs.db
+
+results/
+checkpoints/
+*.pyc
+__pycache__/

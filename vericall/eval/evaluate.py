@@ -147,7 +147,9 @@ def run_benchmark_eval(
     Evaluates configurations across unseen APIs and BFCL.
     """
     unseen_path = DATA_DIR / "eval_unseen_apis.jsonl"
-    bfcl_path = DATA_DIR / "eval_bfcl_subset.jsonl"
+    bfcl_path = DATA_DIR / "eval_bfcl_ast_subset.jsonl"
+    if not bfcl_path.exists():
+        bfcl_path = DATA_DIR / "eval_bfcl_subset.jsonl"
 
     if not unseen_path.exists() or not bfcl_path.exists():
         from vericall.data.prep import run_pipeline
