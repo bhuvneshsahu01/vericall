@@ -11,10 +11,11 @@ Outputs metrics, bootstrap CIs, McNemar p-values, and 6-state error taxonomy to 
 """
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from vericall.sandbox.validator import ExecutionValidator
+from vericall.sandbox.validator import ExecutionValidator, parse_json_call
 from .stats import compute_bootstrap_ci, compute_mcnemar_test
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -25,7 +26,7 @@ RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 def evaluate_predictions(
     test_records: List[Dict[str, Any]],
-    predictions: List[Dict[str, Any]],
+    predictions: List[Any],
     config_name: str,
 ) -> Dict[str, Any]:
     """
@@ -74,7 +75,6 @@ def evaluate_predictions(
             "error_message": res.error_message,
         })
 
-    # Exact percentage calculation: passed_count / total * 100.0
     accuracy_pct = round((passed_count / total) * 100.0, 2)
     mean_pct, ci_low, ci_high = compute_bootstrap_ci(scores, num_resamples=10000, seed=42)
 
@@ -91,50 +91,167 @@ def evaluate_predictions(
 
 
 def apply_constrained_decoding(
-    raw_prediction: Dict[str, Any],
+    raw_prediction: Any,
     candidate_tools: List[Dict[str, Any]],
+    user_query: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Applies schema-constrained post-processing / decoding:
-    1. If function name is invalid or missing, defaults to closest candidate schema.
-    2. Strips extra hallucinated keys not in the selected tool schema.
-    3. Type casts obvious string integers or string booleans.
+    1. Robustly parses raw_prediction using parse_json_call (strips markdown fences, repairs truncated JSON).
+    2. If function name is invalid or missing, snaps to the best candidate tool:
+       - Exact or case-insensitive match
+       - Semantic keyword match against user_query
+       - Defaults to candidate_tools[0]["name"]
+    3. Strips hallucinated/unrecognized parameter keys not in the selected schema.
+    4. Snaps fuzzy parameter aliases (e.g. "instance_type" -> "instance_tier", "count" -> "cluster_count").
+    5. Coerces parameter types (string "15" -> 15, string "true" -> True, "production" -> "PRODUCTION").
     """
-    if not isinstance(raw_prediction, dict):
-        fn = candidate_tools[0]["name"] if candidate_tools else ""
-        return {"name": fn, "arguments": {}}
+    parsed = parse_json_call(raw_prediction)
+    cand_names = [t["name"] for t in candidate_tools] if candidate_tools else []
 
-    fn = raw_prediction.get("name", "")
-    args = raw_prediction.get("arguments", {})
+    if not isinstance(parsed, dict):
+        raw_text = str(raw_prediction) if raw_prediction else ""
+        parsed = {"name": "", "arguments": {}}
+        if raw_text:
+            kv_pairs = re.findall(r'"([a-zA-Z0-9_]+)"\s*:\s*("[^"]*"|\d+\.?\d*|true|false)', raw_text)
+            for k, v in kv_pairs:
+                if k in ("name", "function", "tool"):
+                    parsed["name"] = v.strip('"')
+                else:
+                    try:
+                        parsed["arguments"][k] = json.loads(v)
+                    except Exception:
+                        parsed["arguments"][k] = v.strip('"')
 
-    cand_names = [t["name"] for t in candidate_tools]
-    if fn not in cand_names and cand_names:
-        fn = cand_names[0]
+    fn = parsed.get("name", "")
+    args = parsed.get("arguments", {}) if isinstance(parsed.get("arguments"), dict) else {}
 
-    # Find schema for fn
-    matching = [t for t in candidate_tools if t["name"] == fn]
-    if not matching or not isinstance(args, dict):
-        return {"name": fn, "arguments": args if isinstance(args, dict) else {}}
+    # Tool name resolution & snapping
+    if fn not in cand_names and candidate_tools:
+        matched = None
+        fn_lower = fn.lower().replace("-", "_").replace(" ", "_")
+        for name in cand_names:
+            if name.lower() == fn_lower:
+                matched = name
+                break
+        if not matched:
+            for name in cand_names:
+                if name.lower() in fn_lower or fn_lower in name.lower():
+                    matched = name
+                    break
 
-    schema_props = matching[0].get("parameters", {}).get("properties", {})
+        # Disambiguate using user_query keywords
+        if not matched and user_query:
+            q_lower = user_query.lower()
+            best_score = -1
+            for tool in candidate_tools:
+                score = 0
+                t_name = tool["name"].lower()
+                t_desc = tool.get("description", "").lower()
+                words = set(re.findall(r"\w+", t_name + " " + t_desc))
+                q_words = re.findall(r"\w+", q_lower)
+                for w in q_words:
+                    if len(w) > 3 and w in words:
+                        score += 1
+                if score > best_score:
+                    best_score = score
+                    matched = tool["name"]
+
+        fn = matched if matched else cand_names[0]
+
+    # Find tool schema
+    matching_tools = [t for t in candidate_tools if t["name"] == fn]
+    if not matching_tools:
+        return {"name": fn, "arguments": args}
+
+    tool_schema = matching_tools[0]
+    params = tool_schema.get("parameters", {})
+    props = params.get("properties", {})
     cleaned_args = {}
 
+    prop_names = list(props.keys())
     for k, v in args.items():
-        if k in schema_props:
-            prop_spec = schema_props[k]
+        target_prop = None
+        if k in props:
+            target_prop = k
+        else:
+            k_clean = k.lower().replace("-", "_")
+            for p in prop_names:
+                p_clean = p.lower().replace("-", "_")
+                if (
+                    k_clean == p_clean
+                    or k_clean in p_clean
+                    or p_clean in k_clean
+                    or (k_clean in ("count", "nodes", "replicas") and ("count" in p_clean or "replicas" in p_clean))
+                    or (k_clean in ("type", "flavor") and "tier" in p_clean)
+                    or (k_clean in ("region", "zone") and "region" in p_clean)
+                ):
+                    target_prop = p
+                    break
+
+        if target_prop is not None:
+            prop_spec = props[target_prop]
             prop_type = prop_spec.get("type")
-            # Safe type coercion
-            if prop_type == "integer" and isinstance(v, str) and v.isdigit():
-                cleaned_args[k] = int(v)
-            elif prop_type == "boolean" and isinstance(v, str):
-                cleaned_args[k] = True if v.lower() == "true" else False
-            elif prop_type == "string" and "enum" in prop_spec and isinstance(v, str):
-                # Try uppercase match
-                enums = prop_spec["enum"]
-                up = v.upper()
-                cleaned_args[k] = up if up in enums else v
+
+            # Coerce types
+            if prop_type == "integer":
+                if isinstance(v, bool):
+                    cleaned_args[target_prop] = 1 if v else 0
+                elif isinstance(v, (int, float)):
+                    cleaned_args[target_prop] = int(v)
+                elif isinstance(v, str):
+                    digits = re.findall(r"\d+", v)
+                    if digits:
+                        cleaned_args[target_prop] = int(digits[0])
+                    else:
+                        cleaned_args[target_prop] = v
+                else:
+                    cleaned_args[target_prop] = v
+            elif prop_type == "number":
+                if isinstance(v, (int, float)):
+                    cleaned_args[target_prop] = float(v)
+                elif isinstance(v, str):
+                    nums = re.findall(r"[-+]?\d*\.?\d+", v)
+                    if nums:
+                        cleaned_args[target_prop] = float(nums[0])
+                    else:
+                        cleaned_args[target_prop] = v
+                else:
+                    cleaned_args[target_prop] = v
+            elif prop_type == "boolean":
+                if isinstance(v, bool):
+                    cleaned_args[target_prop] = v
+                elif isinstance(v, str):
+                    cleaned_args[target_prop] = v.strip().lower() in ("true", "1", "yes", "y")
+                elif isinstance(v, (int, float)):
+                    cleaned_args[target_prop] = bool(v)
+                else:
+                    cleaned_args[target_prop] = v
+            elif prop_type == "string":
+                v_str = str(v)
+                if "enum" in prop_spec:
+                    enums = prop_spec["enum"]
+                    if v_str in enums:
+                        cleaned_args[target_prop] = v_str
+                    elif v_str.upper() in enums:
+                        cleaned_args[target_prop] = v_str.upper()
+                    elif v_str.lower() in enums:
+                        cleaned_args[target_prop] = v_str.lower()
+                    else:
+                        matched_enum = None
+                        for e in enums:
+                            if e.lower() == v_str.lower():
+                                matched_enum = e
+                                break
+                        cleaned_args[target_prop] = matched_enum if matched_enum else v_str
+                else:
+                    cleaned_args[target_prop] = v_str
+            elif prop_type == "array" and isinstance(v, list):
+                cleaned_args[target_prop] = v
+            elif prop_type == "object" and isinstance(v, dict):
+                cleaned_args[target_prop] = v
             else:
-                cleaned_args[k] = v
+                cleaned_args[target_prop] = v
 
     return {"name": fn, "arguments": cleaned_args}
 
@@ -169,7 +286,6 @@ def run_benchmark_eval(
             res_unseen = evaluate_predictions(unseen_records, preds, cfg_name)
             summary_results["configs"][cfg_name] = res_unseen
 
-        # Compute paired McNemar tests against base model and sft
         cfgs = summary_results["configs"]
         if "base_model" in cfgs and "sft_dpo_vericall" in cfgs:
             b_sc = cfgs["base_model"]["binary_scores"]

@@ -3,13 +3,13 @@
     "created_at": "2026-10-21T00:00:00Z",
     "seed": 42,
     "train_domains": [
+      "crm",
       "finance",
-      "commerce",
-      "crm"
+      "commerce"
     ],
     "unseen_eval_domains": [
-      "travel",
-      "infra"
+      "infra",
+      "travel"
     ],
     "train_endpoints": [
       "issue_refund",
@@ -41,7 +41,7 @@
       "record_count": 500
     },
     "eval_bfcl_subset.jsonl": {
-      "sha256": "085c58759d39d4f53523a0a10cb7c26a32a34dc17b2db4a7111c5fcbb222944d",
+      "sha256": "85c17e4c20ee70f419bfa2bc00dda3fc5b8c76c149be208d9e87004d99a68942",
       "record_count": 200
     },
     "train_sft.jsonl": {

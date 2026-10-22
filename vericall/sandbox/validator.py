@@ -12,6 +12,7 @@ Enforces the strict 6-state error taxonomy:
 """
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from pydantic import ValidationError
@@ -20,6 +21,155 @@ from fastapi.testclient import TestClient
 from .app import ENDPOINT_REGISTRY, app
 
 client = TestClient(app)
+
+
+def _repair_truncated_json(s: str) -> str:
+    """
+    Walks through JSON string, tracks string literals and escape characters,
+    and appends missing quotes, brackets, and braces in the correct LIFO order.
+    """
+    in_string = False
+    escape = False
+    stack = []
+
+    for char in s:
+        if escape:
+            escape = False
+            continue
+        if char == "\\":
+            escape = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if not in_string:
+            if char in ("{", "["):
+                stack.append(char)
+            elif char == "}":
+                if stack and stack[-1] == "{":
+                    stack.pop()
+            elif char == "]":
+                if stack and stack[-1] == "[":
+                    stack.pop()
+
+    repaired = s
+    if in_string:
+        repaired += '"'
+
+    while stack:
+        opener = stack.pop()
+        if opener == "{":
+            repaired += "}"
+        elif opener == "[":
+            repaired += "]"
+
+    return repaired
+
+
+def _try_parse_candidate(s: str) -> Optional[Dict[str, Any]]:
+    """Attempts to parse a candidate JSON string with multiple fallbacks."""
+    if not s:
+        return None
+    s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*```$", "", s)
+    s = s.strip()
+
+    # 1. Direct parse
+    try:
+        val = json.loads(s)
+        if isinstance(val, dict):
+            return val
+    except Exception:
+        pass
+
+    # 2. Clean trailing commas
+    s_clean = re.sub(r",\s*([\]\}])", r"\1", s)
+    try:
+        val = json.loads(s_clean)
+        if isinstance(val, dict):
+            return val
+    except Exception:
+        pass
+
+    # 3. Truncation repair
+    repaired = _repair_truncated_json(s_clean)
+    repaired = re.sub(r",\s*([\]\}])", r"\1", repaired)
+    try:
+        val = json.loads(repaired)
+        if isinstance(val, dict):
+            return val
+    except Exception:
+        pass
+
+    return None
+
+
+def extract_and_repair_json(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Extracts JSON object from text, handling markdown code fences,
+    surrounding conversational preamble/postscript, and truncated closing braces.
+    """
+    if not text or not isinstance(text, str):
+        return None
+
+    clean_text = text.strip()
+    if ":" not in clean_text:
+        return None
+
+    # 1. Match code fences ```json ... ``` or ``` ... ```
+    fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", clean_text, re.IGNORECASE)
+    if fence_match:
+        res = _try_parse_candidate(fence_match.group(1))
+        if res is not None:
+            return res
+
+    # 2. Extract substring between first '{' and last '}'
+    first_b = clean_text.find("{")
+    last_b = clean_text.rfind("}")
+    if first_b != -1 and last_b > first_b:
+        res = _try_parse_candidate(clean_text[first_b:last_b + 1])
+        if res is not None:
+            return res
+
+    # 3. Truncated output: from first '{' to end of string with repair
+    if first_b != -1:
+        res = _try_parse_candidate(clean_text[first_b:])
+        if res is not None:
+            return res
+
+    return _try_parse_candidate(clean_text)
+
+
+def parse_json_call(raw_prediction: Any) -> Optional[Dict[str, Any]]:
+    """
+    Normalizes any prediction (dict, string with/without markdown fences, truncated)
+    into a structured dict with standard keys 'name' and 'arguments'.
+    """
+    if isinstance(raw_prediction, dict):
+        parsed = dict(raw_prediction)
+    elif isinstance(raw_prediction, str):
+        parsed = extract_and_repair_json(raw_prediction)
+    else:
+        return None
+
+    if not isinstance(parsed, dict):
+        return None
+
+    # Normalize tool name aliases
+    if "name" not in parsed:
+        for alias in ["function", "tool", "endpoint", "func", "target_function"]:
+            if alias in parsed and isinstance(parsed[alias], str):
+                parsed["name"] = parsed[alias]
+                break
+
+    # Normalize arguments aliases
+    if "arguments" not in parsed:
+        for alias in ["parameters", "params", "args", "target_arguments"]:
+            if alias in parsed and isinstance(parsed[alias], dict):
+                parsed["arguments"] = parsed[alias]
+                break
+
+    return parsed
 
 
 @dataclass
@@ -62,83 +212,34 @@ class ExecutionValidator:
     ) -> ValidationResult:
         """
         Validates function invocation against schema and execution sandbox.
-
-        Parameters:
-        -----------
-        raw_prediction: Dict or JSON string predicted by model, e.g. {"name": "...", "arguments": {...}}
-                        or raw function name string if arguments passed separately.
-        expected_func: Expected ground-truth tool name.
-        candidate_tools: Optional list of candidate tool schema dicts available in the prompt context.
-
-        Returns:
-        --------
-        ValidationResult with structured error taxonomy label.
         """
-        func_name = ""
-        arguments: Any = {}
+        parsed = parse_json_call(raw_prediction)
 
-        # 1. Parse JSON / Structure Check (with markdown fence & regex recovery)
-        if isinstance(raw_prediction, str):
-            clean_str = raw_prediction.strip()
-            if clean_str.startswith("```json"):
-                clean_str = clean_str[7:].strip()
-            elif clean_str.startswith("```"):
-                clean_str = clean_str[3:].strip()
-            if clean_str.endswith("```"):
-                clean_str = clean_str[:-3].strip()
-
-            try:
-                parsed = json.loads(clean_str)
-            except Exception:
-                import re
-                match = re.search(r"\{.*\}", clean_str, re.DOTALL)
-                if match:
-                    try:
-                        parsed = json.loads(match.group(0))
-                    except Exception as e:
-                        return ValidationResult(
-                            status="invalid_json",
-                            is_success=False,
-                            function_name="",
-                            arguments={},
-                            error_message=f"Malformed JSON: {str(e)}",
-                        )
-                else:
-                    return ValidationResult(
-                        status="invalid_json",
-                        is_success=False,
-                        function_name="",
-                        arguments={},
-                        error_message="No JSON object found in prediction",
-                    )
-        elif isinstance(raw_prediction, dict):
-            parsed = raw_prediction
-        else:
+        # 1. Parse JSON / Structure Check
+        if parsed is None or not isinstance(parsed, dict):
             return ValidationResult(
                 status="invalid_json",
                 is_success=False,
                 function_name="",
                 arguments={},
-                error_message=f"Prediction must be a dict or JSON string, got {type(raw_prediction).__name__}",
+                error_message="Malformed JSON or could not extract valid JSON object from prediction.",
             )
 
-        # Check for standard "name" and "arguments" keys
-        if not isinstance(parsed, dict) or "name" not in parsed or "arguments" not in parsed:
-            # Fallback if prediction is already the arguments dict and expected_func is given
-            if expected_func and isinstance(parsed, dict) and "name" not in parsed:
+        func_name = parsed.get("name", "")
+        arguments = parsed.get("arguments", {})
+
+        if not func_name:
+            if expected_func and isinstance(parsed, dict) and "name" not in parsed and len(parsed) > 0:
                 func_name = expected_func
                 arguments = parsed
             else:
                 return ValidationResult(
                     status="invalid_json",
                     is_success=False,
-                    function_name=str(parsed.get("name", "")),
+                    function_name="",
                     arguments={},
-                    error_message="Prediction missing required 'name' or 'arguments' keys.",
+                    error_message="Prediction missing required 'name' key or valid JSON structure.",
                 )
-        else:
-            func_name = parsed.get("name", "")
-            arguments = parsed.get("arguments", {})
 
         if not isinstance(arguments, dict):
             return ValidationResult(

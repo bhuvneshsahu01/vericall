@@ -467,97 +467,191 @@ def generate_unseen_eval_data(total_samples: int = 500) -> List[Dict[str, Any]]:
 
 
 def generate_bfcl_subset(num_samples: int = 200) -> List[Dict[str, Any]]:
-    """Generates decontaminated subset of general function calling requests."""
+    """
+    Generates N=200 decontaminated BFCL evaluation samples.
+    Every prompt contains 6 candidate tool schemas (1 target + 5 decoys shuffled)
+    requiring strict parameter type, enum, and required-field adherence.
+    """
+    random.seed(SEED + 99)
+
+    tool_pool = {
+        "calculate": {
+            "name": "calculate",
+            "description": "Perform basic arithmetic calculations.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "operation": {"type": "string", "enum": ["add", "multiply", "subtract", "divide"]},
+                    "a": {"type": "number", "description": "First operand"},
+                    "b": {"type": "number", "description": "Second operand"},
+                },
+                "required": ["operation", "a", "b"],
+            },
+        },
+        "get_current_weather": {
+            "name": "get_current_weather",
+            "description": "Fetch real-time weather observations for a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "description": "City and state/country"},
+                    "unit": {"type": "string", "enum": ["metric", "imperial"]},
+                },
+                "required": ["location", "unit"],
+            },
+        },
+        "create_calendar_event": {
+            "name": "create_calendar_event",
+            "description": "Add an appointment or sync event to user calendar.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Event title"},
+                    "date": {"type": "string", "pattern": "^\d{4}-\d{2}-\d{2}$", "description": "Date (YYYY-MM-DD)"},
+                    "time": {"type": "string", "pattern": "^\d{2}:\d{2}$", "description": "Time (HH:MM)"},
+                    "duration_minutes": {"type": "integer", "description": "Duration in minutes"},
+                },
+                "required": ["title", "date", "time", "duration_minutes"],
+            },
+        },
+        "convert_units": {
+            "name": "convert_units",
+            "description": "Convert physical quantities between measurement units.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "value": {"type": "number", "description": "Numerical magnitude"},
+                    "from_unit": {"type": "string", "enum": ["km", "miles", "celsius", "fahrenheit", "kg", "pounds"]},
+                    "to_unit": {"type": "string", "enum": ["km", "miles", "celsius", "fahrenheit", "kg", "pounds"]},
+                },
+                "required": ["value", "from_unit", "to_unit"],
+            },
+        },
+        "send_email": {
+            "name": "send_email",
+            "description": "Send an electronic mail message to a recipient.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "recipient": {"type": "string", "description": "Destination email address"},
+                    "subject": {"type": "string", "description": "Subject header"},
+                    "body": {"type": "string", "description": "Email body content"},
+                    "urgent": {"type": "boolean", "description": "Urgent delivery flag"},
+                },
+                "required": ["recipient", "subject", "body", "urgent"],
+            },
+        },
+        "search_database": {
+            "name": "search_database",
+            "description": "Execute structured query against indexed database records.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "table_name": {"type": "string", "enum": ["customers", "orders", "inventory", "transactions"]},
+                    "filter_query": {"type": "string", "description": "Search filter string"},
+                    "limit": {"type": "integer", "description": "Max rows to return"},
+                },
+                "required": ["table_name", "filter_query", "limit"],
+            },
+        },
+        "set_device_alarm": {
+            "name": "set_device_alarm",
+            "description": "Set a wakeup or reminder alarm on smart device.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "alarm_time": {"type": "string", "pattern": "^\d{2}:\d{2}$", "description": "Alarm time (HH:MM)"},
+                    "label": {"type": "string", "description": "Alarm label"},
+                    "repeat_daily": {"type": "boolean", "description": "Repeat alarm daily"},
+                },
+                "required": ["alarm_time", "label", "repeat_daily"],
+            },
+        },
+        "generate_image": {
+            "name": "generate_image",
+            "description": "Synthesize a visual image from descriptive text prompt.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "Visual scene description"},
+                    "resolution": {"type": "string", "enum": ["512x512", "1024x1024", "1920x1080"]},
+                    "aspect_ratio": {"type": "string", "enum": ["1:1", "16:9", "4:3"]},
+                },
+                "required": ["prompt", "resolution", "aspect_ratio"],
+            },
+        },
+    }
+
+    all_tool_names = list(tool_pool.keys())
+    cities = ["London, UK", "New York, USA", "Tokyo, Japan", "Paris, France", "Sydney, Australia", "Singapore"]
     bfcl_data = []
-    categories = ["math_calculator", "weather_query", "calendar_scheduler", "unit_converter"]
-    cities = ["New York", "London", "Tokyo", "Paris", "Sydney", "Berlin", "Toronto", "Singapore"]
 
     for i in range(num_samples):
-        cat = categories[i % len(categories)]
-        if cat == "math_calculator":
-            a = random.randint(12, 999)
-            b = random.randint(12, 999)
-            op = random.choice(["add", "multiply", "subtract"])
-            q = f"Calculate the result of {a} {op} {b}."
-            target = "calculate"
+        target_name = all_tool_names[i % len(all_tool_names)]
+        
+        # Build query and args based on target_name
+        if target_name == "calculate":
+            a = random.randint(15, 950)
+            b = random.randint(15, 950)
+            op = random.choice(["add", "multiply", "subtract", "divide"])
+            q = f"Perform arithmetic computation: {op} {a} and {b}."
             args = {"operation": op, "a": float(a), "b": float(b)}
-            tools = [{
-                "name": "calculate",
-                "description": "Perform basic arithmetic calculations.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "operation": {"type": "string", "enum": ["add", "multiply", "subtract"]},
-                        "a": {"type": "number"},
-                        "b": {"type": "number"},
-                    },
-                    "required": ["operation", "a", "b"],
-                }
-            }]
-        elif cat == "weather_query":
+        elif target_name == "get_current_weather":
             city = random.choice(cities)
-            q = f"What is the current weather forecast for {city}?"
-            target = "get_current_weather"
-            args = {"location": city, "unit": "metric"}
-            tools = [{
-                "name": "get_current_weather",
-                "description": "Fetch real-time weather observations for a city.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "location": {"type": "string"},
-                        "unit": {"type": "string", "enum": ["metric", "imperial"]},
-                    },
-                    "required": ["location"],
-                }
-            }]
-        elif cat == "calendar_scheduler":
+            unit = random.choice(["metric", "imperial"])
+            q = f"Get the current weather forecast for {city} in {unit} units."
+            args = {"location": city, "unit": unit}
+        elif target_name == "create_calendar_event":
             day = random.randint(1, 28)
             time_str = f"{random.randint(9, 17):02d}:00"
-            q = f"Schedule a calendar event titled 'Team Sync' on 2026-11-{day:02d} at {time_str}."
-            target = "create_calendar_event"
-            args = {"title": "Team Sync", "date": f"2026-11-{day:02d}", "time": time_str}
-            tools = [{
-                "name": "create_calendar_event",
-                "description": "Add an appointment or sync event to user calendar.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "title": {"type": "string"},
-                        "date": {"type": "string"},
-                        "time": {"type": "string"},
-                    },
-                    "required": ["title", "date", "time"],
-                }
-            }]
-        else:
-            val = random.randint(5, 100)
+            dur = random.choice([30, 45, 60, 90])
+            title = random.choice(["Quarterly Roadmap Review", "Architecture Sync", "Sprint Retrospective"])
+            q = f"Schedule a calendar event titled '{title}' on 2026-11-{day:02d} at {time_str} lasting {dur} minutes."
+            args = {"title": title, "date": f"2026-11-{day:02d}", "time": time_str, "duration_minutes": dur}
+        elif target_name == "convert_units":
+            val = random.randint(5, 120)
             u_from, u_to = random.choice([("km", "miles"), ("celsius", "fahrenheit"), ("kg", "pounds")])
-            q = f"Convert {val} {u_from} to {u_to}."
-            target = "convert_units"
+            q = f"Convert {val} {u_from} into {u_to}."
             args = {"value": float(val), "from_unit": u_from, "to_unit": u_to}
-            tools = [{
-                "name": "convert_units",
-                "description": "Convert physical quantities between measurement units.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "value": {"type": "number"},
-                        "from_unit": {"type": "string"},
-                        "to_unit": {"type": "string"},
-                    },
-                    "required": ["value", "from_unit", "to_unit"],
-                }
-            }]
+        elif target_name == "send_email":
+            email = f"lead_{random.randint(100, 999)}@corp.net"
+            subj = random.choice(["Project Milestone Report", "Urgent Incident Update", "Weekly Digest"])
+            urgent = random.choice([True, False])
+            q = f"Send an {'urgent ' if urgent else ''}email to {email} with subject '{subj}' and body 'Please review the attached release notes immediately.'."
+            args = {"recipient": email, "subject": subj, "body": "Please review the attached release notes immediately.", "urgent": urgent}
+        elif target_name == "search_database":
+            tbl = random.choice(["customers", "orders", "inventory", "transactions"])
+            lim = random.choice([10, 25, 50])
+            q = f"Search the '{tbl}' database table for records matching 'status=active' with a limit of {lim} records."
+            args = {"table_name": tbl, "filter_query": "status=active", "limit": lim}
+        elif target_name == "set_device_alarm":
+            alarm_time = f"{random.randint(6, 9):02d}:30"
+            lbl = random.choice(["Morning Standup Alarm", "Workout Reminder", "Medication Time"])
+            rep = random.choice([True, False])
+            q = f"Set an alarm for {alarm_time} labeled '{lbl}' {'with daily repeat' if rep else 'without repeating'}."
+            args = {"alarm_time": alarm_time, "label": lbl, "repeat_daily": rep}
+        else: # generate_image
+            prompt_txt = random.choice(["Futuristic city skyline at sunset in cyberpunk style", "Hyper-realistic portrait of an astronaut on Mars", "Serene Japanese zen garden in autumn foliage"])
+            res = random.choice(["512x512", "1024x1024", "1920x1080"])
+            aspect = random.choice(["1:1", "16:9", "4:3"])
+            q = f"Generate an image of '{prompt_txt}' at {res} resolution with {aspect} aspect ratio."
+            args = {"prompt": prompt_txt, "resolution": res, "aspect_ratio": aspect}
 
-        prompt = build_tool_calling_prompt(q, tools)
+        # Select 5 decoys from the remaining 7 tools
+        decoys = [name for name in all_tool_names if name != target_name]
+        sampled_decoys = random.sample(decoys, 5)
+        selected_tool_names = [target_name] + sampled_decoys
+        random.shuffle(selected_tool_names)
+        candidate_schemas = [tool_pool[name] for name in selected_tool_names]
+
+        prompt = build_tool_calling_prompt(q, candidate_schemas)
         bfcl_data.append({
             "id": f"eval_bfcl_{i:03d}",
             "domain": "bfcl_standard",
             "query": q,
-            "target_function": target,
+            "target_function": target_name,
             "target_arguments": args,
-            "candidate_tools": tools,
+            "candidate_tools": candidate_schemas,
             "prompt": prompt,
         })
 
