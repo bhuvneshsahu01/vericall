@@ -198,11 +198,14 @@ def mine_dpo_pairs(num_pairs: int = 1000) -> List[Dict[str, Any]]:
 
         rejected_call = {"name": rej_fn, "arguments": rej_args}
 
+        chosen_completion = json.dumps(chosen_call) + "<|im_end|>"
+        rejected_completion = json.dumps(rejected_call) + "<|im_end|>"
+
         dpo_pairs.append({
             "id": f"dpo_pair_{idx:04d}",
             "prompt": prompt,
-            "chosen": json.dumps(chosen_call),
-            "rejected": json.dumps(rejected_call),
+            "chosen": chosen_completion,
+            "rejected": rejected_completion,
             "chosen_status": "passed",
             "rejected_status": actual_status,
             "rejected_error_detail": rej_res.error_message,

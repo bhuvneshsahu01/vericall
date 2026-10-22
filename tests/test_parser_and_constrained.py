@@ -124,3 +124,27 @@ def test_bfcl_ast_subset_has_6_candidates_per_prompt():
         assert len(r["candidate_tools"]) == 6, f"Sample {r['id']} does not have 6 candidate tools"
         assert r["target_function"] in [t["name"] for t in r["candidate_tools"]]
         assert "Available Tools:" in r["prompt"]
+
+
+def test_parse_json_call_multiple_json_objects():
+    raw = 'Here is the tool call: {"name": "provision_compute_node", "arguments": {"instance_tier": "m6i.4xlarge"}} and here is another object {"status": "ok"}'
+    parsed = parse_json_call(raw)
+    assert parsed is not None
+    assert parsed["name"] == "provision_compute_node"
+    assert parsed["arguments"]["instance_tier"] == "m6i.4xlarge"
+
+
+def test_parse_json_call_unclosed_fence_with_repair():
+    raw = '```json\n{"name": "provision_compute_node", "arguments": {"cluster_count": 15'
+    parsed = parse_json_call(raw)
+    assert parsed is not None
+    assert parsed["name"] == "provision_compute_node"
+    assert parsed["arguments"]["cluster_count"] == 15
+
+
+def test_parse_json_call_stringified_arguments():
+    raw = r'{"name": "rotate_iam_credentials", "arguments": "{\"service_account_id\": \"sa-test\"}"}'
+    parsed = parse_json_call(raw)
+    assert parsed is not None
+    assert parsed["name"] == "rotate_iam_credentials"
+    assert parsed["arguments"]["service_account_id"] == "sa-test"

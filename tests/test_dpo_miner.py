@@ -28,6 +28,8 @@ def test_dpo_dataset_structure_and_error_taxonomy():
         assert "Available Tools:" in p["prompt"]
         assert len(p["chosen"]) > 5
         assert len(p["rejected"]) > 5
+        assert p["chosen"].endswith("<|im_end|>"), f"Chosen must end with <|im_end|>: {p['chosen']}"
+        assert p["rejected"].endswith("<|im_end|>"), f"Rejected must end with <|im_end|>: {p['rejected']}" 
         status_counts[p["rejected_status"]] = status_counts.get(p["rejected_status"], 0) + 1
 
     # Verify target distribution

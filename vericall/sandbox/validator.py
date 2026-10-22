@@ -104,6 +104,43 @@ def _try_parse_candidate(s: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _extract_first_json_object(s: str) -> Optional[str]:
+    """
+    Extracts the first balanced {...} JSON object from the string,
+    properly accounting for string literals and escape characters.
+    If the string is truncated before closing braces balance (depth > 0),
+    returns the substring from the first '{' to the end of the string.
+    """
+    if not s or "{" not in s:
+        return None
+    first_b = s.find("{")
+    depth = 0
+    in_string = False
+    escape = False
+
+    for i in range(first_b, len(s)):
+        c = s[i]
+        if escape:
+            escape = False
+            continue
+        if c == "\\":
+            escape = True
+            continue
+        if c == '"':
+            in_string = not in_string
+            continue
+        if not in_string:
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return s[first_b:i + 1]
+
+    # Truncated JSON without trailing closing brace(s)
+    return s[first_b:]
+
+
 def extract_and_repair_json(text: str) -> Optional[Dict[str, Any]]:
     """
     Extracts JSON object from text, handling markdown code fences,
@@ -113,17 +150,31 @@ def extract_and_repair_json(text: str) -> Optional[Dict[str, Any]]:
         return None
 
     clean_text = text.strip()
-    if ":" not in clean_text:
+    if "{" not in clean_text:
         return None
 
-    # 1. Match code fences ```json ... ``` or ``` ... ```
-    fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", clean_text, re.IGNORECASE)
+    # 1. Match code fences ```json ... ``` or unclosed ```json ...
+    fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)(?:```|$)", clean_text, re.IGNORECASE)
     if fence_match:
-        res = _try_parse_candidate(fence_match.group(1))
+        fence_content = fence_match.group(1).strip()
+        if fence_content:
+            first_obj = _extract_first_json_object(fence_content)
+            if first_obj:
+                res = _try_parse_candidate(first_obj)
+                if res is not None:
+                    return res
+            res = _try_parse_candidate(fence_content)
+            if res is not None:
+                return res
+
+    # 2. Extract first JSON object from clean_text
+    first_obj = _extract_first_json_object(clean_text)
+    if first_obj:
+        res = _try_parse_candidate(first_obj)
         if res is not None:
             return res
 
-    # 2. Extract substring between first '{' and last '}'
+    # 3. Extract substring between first '{' and last '}'
     first_b = clean_text.find("{")
     last_b = clean_text.rfind("}")
     if first_b != -1 and last_b > first_b:
@@ -131,7 +182,7 @@ def extract_and_repair_json(text: str) -> Optional[Dict[str, Any]]:
         if res is not None:
             return res
 
-    # 3. Truncated output: from first '{' to end of string with repair
+    # 4. Truncated output: from first '{' to end of string with repair
     if first_b != -1:
         res = _try_parse_candidate(clean_text[first_b:])
         if res is not None:
@@ -165,9 +216,18 @@ def parse_json_call(raw_prediction: Any) -> Optional[Dict[str, Any]]:
     # Normalize arguments aliases
     if "arguments" not in parsed:
         for alias in ["parameters", "params", "args", "target_arguments"]:
-            if alias in parsed and isinstance(parsed[alias], dict):
+            if alias in parsed and isinstance(parsed[alias], (dict, str)):
                 parsed["arguments"] = parsed[alias]
                 break
+
+    # Normalize stringified arguments if serialized as a JSON string
+    if isinstance(parsed.get("arguments"), str):
+        try:
+            parsed_args = json.loads(parsed["arguments"])
+            if isinstance(parsed_args, dict):
+                parsed["arguments"] = parsed_args
+        except Exception:
+            pass
 
     return parsed
 
