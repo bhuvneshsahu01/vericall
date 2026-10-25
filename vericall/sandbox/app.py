@@ -143,30 +143,41 @@ ENDPOINT_REGISTRY: Dict[str, Dict[str, Any]] = {
 
 
 def get_tool_json_schema(name: str) -> Dict[str, Any]:
-    """Generates a standardized OpenAPI/JSON schema block for a tool."""
+    """Generates a standardized, compact OpenAPI/JSON schema block for a tool."""
     if name not in ENDPOINT_REGISTRY:
         raise KeyError(f"Tool '{name}' not found in ENDPOINT_REGISTRY.")
     meta = ENDPOINT_REGISTRY[name]
     model_cls = meta["model"]
     raw_schema = model_cls.model_json_schema()
     
-    # Strip unnecessary title metadata for compact prompt injection
     props = raw_schema.get("properties", {})
-    reqs = raw_schema.get("required", [])
     defs = raw_schema.get("$defs", {})
+    clean_props = {}
+    for p_name, p_info in props.items():
+        cp = {"type": p_info.get("type", "string")}
+        if "enum" in p_info:
+            cp["enum"] = p_info["enum"]
+        if "items" in p_info:
+            it = p_info["items"]
+            if isinstance(it, dict) and "$ref" in it:
+                ref_name = it["$ref"].split("/")[-1]
+                sub_props = defs.get(ref_name, {}).get("properties", {})
+                cp["items"] = {"type": "object", "properties": {k: {"type": v.get("type", "string")} for k, v in sub_props.items()}}
+            elif isinstance(it, dict):
+                cp["items"] = {"type": it.get("type", "string")}
+            else:
+                cp["items"] = it
+        clean_props[p_name] = cp
 
     params_obj = {
         "type": "object",
-        "properties": props,
-        "required": reqs,
-        "additionalProperties": False,
+        "properties": clean_props,
+        "required": raw_schema.get("required", []),
     }
-    if defs:
-        params_obj["$defs"] = defs
 
     return {
         "name": name,
-        "description": meta["description"],
+        "description": meta["description"][:16].strip(),
         "parameters": params_obj,
     }
 

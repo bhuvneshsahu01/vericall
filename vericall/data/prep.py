@@ -57,13 +57,11 @@ def build_tool_calling_prompt(user_query: str, candidate_schemas: List[Dict[str,
     Standard tool-calling prompt injection format.
     Every prompt contains 6 JSON tool schemas in Available Tools.
     """
-    tools_block = json.dumps(candidate_schemas, indent=2)
+    tools_block = "\n".join(json.dumps(s, separators=(",", ":")) for s in candidate_schemas)
     system_msg = (
         "You are a precise REST API tool-calling assistant. Given the user request, select "
-        "the single most appropriate tool from the `Available Tools` JSON schema list below "
-        "and output ONLY a single valid JSON object with keys \"name\" and \"arguments\". "
-        "Do not invent parameter names outside the selected tool's schema, and strictly "
-        "follow all parameter types, enums, and formatting rules.\n\n"
+        "the tool from `Available Tools` below and output ONLY a valid JSON object with keys "
+        "\"name\" and \"arguments\".\n\n"
         f"Available Tools:\n{tools_block}\n\n"
         "Output format:\n"
         '{\"name\": \"<tool_name>\", \"arguments\": {<exact_schema_parameters>}}'
