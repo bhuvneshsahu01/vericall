@@ -359,7 +359,7 @@ def generate_unseen_eval_data(total_samples: int = 500) -> List[Dict[str, Any]]:
                     "environment_tag": env,
                     "resource_tags": tags,
                 }
-                query = f"Provision {cnt} compute nodes of tier {tier} in region {reg} for {env} environment. Tag owner as {tags['owner']}."
+                query = f"Provision {cnt} compute nodes of tier {tier} in cloud region {reg} for {env.lower()} environment. Tag owner as {tags['owner']} and cost_center as {tags['cost_center']}."
 
             elif fn == "scale_kubernetes_cluster":
                 cl_name = f"k8s-prod-{random.randint(100, 999)}"
@@ -373,7 +373,8 @@ def generate_unseen_eval_data(total_samples: int = 500) -> List[Dict[str, Any]]:
                     "scaling_strategy": strat,
                     "autoscale_config": {"min_nodes": 2, "max_nodes": 60},
                 }
-                query = f"Scale node pool '{pool}' in cluster {cl_name} to {rep} desired replicas using {strat} strategy with min_nodes=2 and max_nodes=60."
+                strat_phrase = {"IMMEDIATE": "immediate workload migration", "DRAIN_GRADUAL": "gradual draining", "SURGE_FIRST": "surge first rollout (provision new nodes before terminating old)"}[strat]
+                query = f"Scale node pool '{pool}' in cluster {cl_name} to {rep} desired replicas using {strat_phrase} with autoscale limits min_nodes=2 and max_nodes=60."
 
             elif fn == "rotate_iam_credentials":
                 sa = f"sa-{random.choice(['data', 'api', 'etl'])}{random.randint(1000, 9999)}"
@@ -386,7 +387,8 @@ def generate_unseen_eval_data(total_samples: int = 500) -> List[Dict[str, Any]]:
                     "notify_emails": [f"security-alerts@company{random.randint(1, 9)}.com"],
                     "force_revocation": False,
                 }
-                query = f"Rotate {ctype} credentials for service account {sa} with a {grace}-hour grace period and alert security team."
+                ctype_phrase = {"OAUTH2_KEY": "OAuth2 client credentials", "SSH_RSA": "SSH RSA keypair", "X509_CERTIFICATE": "X.509 certificate", "API_TOKEN": "REST API token"}[ctype]
+                query = f"Rotate {ctype_phrase} for service account {sa} with a {grace}-hour grace period and alert security team."
 
             elif fn == "search_multi_leg_flights":
                 orig, mid, dest = random.sample(airports, 3)
@@ -404,7 +406,8 @@ def generate_unseen_eval_data(total_samples: int = 500) -> List[Dict[str, Any]]:
                     "flexible_dates": True,
                     "preferred_alliances": ["STAR_ALLIANCE"],
                 }
-                query = f"Search multi-leg flights: {orig} to {mid} on {d1}, then {mid} to {dest} on {d2} in {cab} class for {pax} passengers."
+                cab_phrase = {"ECONOMY": "economy cabin", "PREMIUM_ECONOMY": "premium economy seating", "BUSINESS": "business class", "FIRST": "first class"}[cab]
+                query = f"Search multi-leg flights: {orig} to {mid} on {d1}, then {mid} to {dest} on {d2} in {cab_phrase} for {pax} passengers."
 
             elif fn == "reserve_corporate_hotel":
                 prop = f"HTL-{random.choice(['NY', 'SF', 'LN', 'TK'])}-{random.randint(1000, 9999)}"
@@ -421,7 +424,8 @@ def generate_unseen_eval_data(total_samples: int = 500) -> List[Dict[str, Any]]:
                     "corporate_billing_code": corp,
                     "guest_manifest": manifest,
                 }
-                query = f"Reserve a {room} room at {prop} checking in {cin} and checking out {cout} for {manifest[0]['first_name']} {manifest[0]['last_name']}. Bill to {corp}."
+                room_phrase = {"STANDARD_KING": "standard king", "EXECUTIVE_SUITE": "executive suite", "DOUBLE_QUEEN": "double queen", "PRESIDENTIAL": "presidential quarters"}[room]
+                query = f"Reserve a {room_phrase} room at {prop} checking in {cin} and checking out {cout} for {manifest[0]['first_name']} {manifest[0]['last_name']}. Bill to {corp}."
 
             else:  # cancel_itinerary_segment
                 pnr = f"PNR-{random.randint(100000, 999999)}"
@@ -435,7 +439,8 @@ def generate_unseen_eval_data(total_samples: int = 500) -> List[Dict[str, Any]]:
                     "request_credit_voucher": True,
                     "refund_override_notes": notes,
                 }
-                query = f"Cancel segment {seg} on booking {pnr} due to {rsn.replace('_', ' ').lower()}. Request credit voucher. Notes: {notes}."
+                rsn_phrase = {"CLIENT_RESCHEDULE": "client requested reschedule", "WEATHER_DISRUPTION": "severe weather disruption", "MEETING_CANCELLED": "business meeting cancellation", "DUPLICATE_BOOKING": "duplicate reservation made in error"}[rsn]
+                query = f"Cancel segment {seg} on booking {pnr} due to {rsn_phrase}. Request credit voucher. Notes: {notes}."
 
             raw_eval.append((fn, query, args))
 
@@ -615,7 +620,7 @@ def generate_bfcl_subset(num_samples: int = 200) -> List[Dict[str, Any]]:
             email = f"lead_{random.randint(100, 999)}@corp.net"
             subj = random.choice(["Project Milestone Report", "Urgent Incident Update", "Weekly Digest"])
             urgent = random.choice([True, False])
-            q = f"Send an {'urgent ' if urgent else ''}email to {email} with subject '{subj}' and body 'Please review the attached release notes immediately.'."
+            q = f"Send a {'urgent' if urgent else 'standard non-urgent'} email to {email} with subject '{subj}' and body 'Please review the attached release notes immediately.'."
             args = {"recipient": email, "subject": subj, "body": "Please review the attached release notes immediately.", "urgent": urgent}
         elif target_name == "search_database":
             tbl = random.choice(["customers", "orders", "inventory", "transactions"])

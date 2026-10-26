@@ -1,52 +1,46 @@
 {
-  "dataset_metadata": {
-    "created_at": "2026-10-21T00:00:00Z",
-    "seed": 42,
-    "train_domains": [
-      "crm",
-      "finance",
-      "commerce"
-    ],
-    "unseen_eval_domains": [
-      "infra",
-      "travel"
-    ],
-    "train_endpoints": [
-      "issue_refund",
-      "create_invoice",
-      "transfer_funds",
-      "audit_ledger_entries",
-      "query_inventory",
-      "apply_discount_code",
-      "update_subscription",
-      "create_support_ticket",
-      "update_customer_tier",
-      "schedule_webhook"
-    ],
-    "unseen_endpoints": [
-      "provision_compute_node",
-      "scale_kubernetes_cluster",
-      "rotate_iam_credentials",
-      "search_multi_leg_flights",
-      "reserve_corporate_hotel",
-      "cancel_itinerary_segment"
-    ],
+  "metadata": {
+    "benchmark": "VeriCall-Benchmark-v1.0",
+    "description": "Frozen decontaminated benchmark splits with SHA-256 integrity hashes.",
+    "sft_train_count": 2000,
+    "dpo_train_count": 1000,
     "unseen_eval_count": 500,
-    "bfcl_eval_count": 200,
-    "train_count": 2000
+    "bfcl_eval_count": 200
   },
   "file_hashes": {
-    "eval_unseen_apis.jsonl": {
-      "sha256": "f91f4e9b385141f79931124eac3d7b145b326b3dd6bc9dc4ee98c2e1e10c72f7",
-      "record_count": 500
-    },
-    "eval_bfcl_subset.jsonl": {
-      "sha256": "2f420cca768aad3ca70d5099dc2c53b1565105030fdc7cd1f24d1e39dba72af0",
-      "record_count": 200
-    },
     "train_sft.jsonl": {
       "sha256": "e31dd56c5437f35e5706f713fd0688a69441eb1e6b7d1a880b7e084a0093023a",
       "record_count": 2000
+    },
+    "train_dpo.jsonl": {
+      "sha256": "da051df24e36801c0d0bf5c253096bbada1893b3be1dd98beb062f065f20d063",
+      "record_count": 1000
+    },
+    "eval_unseen_apis.jsonl": {
+      "sha256": "1bbe5d2852300e7d516bc2c08cc78bae099bb22f584a6408837fb4ac98d62d26",
+      "record_count": 500
+    },
+    "eval_bfcl_subset.jsonl": {
+      "sha256": "76b6f908a6bf55546e858c5ed49f723f75e7ce656c939e0c35f992716cdab479",
+      "record_count": 200
+    }
+  },
+  "files": {
+    "train_sft.jsonl": {
+      "sha256": "e31dd56c5437f35e5706f713fd0688a69441eb1e6b7d1a880b7e084a0093023a",
+      "record_count": 2000
+    },
+    "train_dpo.jsonl": {
+      "sha256": "da051df24e36801c0d0bf5c253096bbada1893b3be1dd98beb062f065f20d063",
+      "record_count": 1000
+    },
+    "eval_unseen_apis.jsonl": {
+      "sha256": "1bbe5d2852300e7d516bc2c08cc78bae099bb22f584a6408837fb4ac98d62d26",
+      "record_count": 500
+    },
+    "eval_bfcl_subset.jsonl": {
+      "sha256": "76b6f908a6bf55546e858c5ed49f723f75e7ce656c939e0c35f992716cdab479",
+      "record_count": 200
     }
   }
 }

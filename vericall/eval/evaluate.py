@@ -97,18 +97,28 @@ def apply_constrained_decoding(
 ) -> Dict[str, Any]:
     """
     Applies schema-constrained post-processing / decoding:
-    1. Robustly parses raw_prediction using parse_json_call (strips markdown fences, repairs truncated JSON).
-    2. If function name is invalid or missing, snaps to the best candidate tool:
-       - Exact or case-insensitive match
-       - Semantic keyword match against user_query
-       - Defaults to candidate_tools[0]["name"]
-    3. Strips hallucinated/unrecognized parameter keys not in the selected schema.
-    4. Snaps fuzzy parameter aliases (e.g. "instance_type" -> "instance_tier", "count" -> "cluster_count").
-    5. Coerces parameter types (string "15" -> 15, string "true" -> True, "production" -> "PRODUCTION").
+    1. Non-destructive: if raw_prediction already parses and passes ExecutionValidator, return it UNCHANGED.
+    2. Robustly extracts JSON call from markdown code fences, tool_call tags, or truncated braces.
+    3. Snaps missing or mistyped function names to the closest candidate tool in the prompt.
+    4. Strips hallucinated/unrecognized parameter keys not present in the target tool's schema.
+    5. Fixes enum casing mismatches (e.g. "immediate" -> "IMMEDIATE").
+    6. Coerces parameter types (stringified numbers/booleans) while preserving objects/dictionaries.
     """
-    parsed = parse_json_call(raw_prediction)
-    cand_names = [t["name"] for t in candidate_tools] if candidate_tools else []
+    cand_tools = candidate_tools or []
+    cand_names = [t["name"] for t in cand_tools]
+    validator = ExecutionValidator()
 
+    parsed = parse_json_call(raw_prediction)
+
+    # 1. Non-destructive early return: if parsed call already validates against candidate tools, keep it!
+    if isinstance(parsed, dict) and "name" in parsed and "arguments" in parsed:
+        fn_name = parsed["name"]
+        if fn_name in cand_names:
+            val_res = validator.validate_call(parsed, expected_func=fn_name, candidate_tools=cand_tools)
+            if val_res.status == "passed":
+                return parsed
+
+    # 2. Robust parsing fallback if text was severely mangled
     if not isinstance(parsed, dict):
         raw_text = str(raw_prediction) if raw_prediction else ""
         parsed = {"name": "", "arguments": {}}
@@ -126,8 +136,8 @@ def apply_constrained_decoding(
     fn = parsed.get("name", "")
     args = parsed.get("arguments", {}) if isinstance(parsed.get("arguments"), dict) else {}
 
-    # Tool name resolution & snapping
-    if fn not in cand_names and candidate_tools:
+    # 3. Resolve tool name to best candidate
+    if fn not in cand_names and cand_names:
         matched = None
         fn_lower = fn.lower().replace("-", "_").replace(" ", "_")
         for name in cand_names:
@@ -139,12 +149,10 @@ def apply_constrained_decoding(
                 if name.lower() in fn_lower or fn_lower in name.lower():
                     matched = name
                     break
-
-        # Disambiguate using user_query keywords
         if not matched and user_query:
             q_lower = user_query.lower()
             best_score = -1
-            for tool in candidate_tools:
+            for tool in cand_tools:
                 score = 0
                 t_name = tool["name"].lower()
                 t_desc = tool.get("description", "").lower()
@@ -156,20 +164,21 @@ def apply_constrained_decoding(
                 if score > best_score:
                     best_score = score
                     matched = tool["name"]
-
         fn = matched if matched else cand_names[0]
 
     # Find tool schema
-    matching_tools = [t for t in candidate_tools if t["name"] == fn]
+    matching_tools = [t for t in cand_tools if t["name"] == fn]
     if not matching_tools:
         return {"name": fn, "arguments": args}
 
     tool_schema = matching_tools[0]
     params = tool_schema.get("parameters", {})
     props = params.get("properties", {})
+    prop_names = list(props.keys())
+
     cleaned_args = {}
 
-    prop_names = list(props.keys())
+    # 4. Filter, alias-match, and type-coerce arguments strictly according to schema
     for k, v in args.items():
         target_prop = None
         if k in props:
@@ -178,80 +187,86 @@ def apply_constrained_decoding(
             k_clean = k.lower().replace("-", "_")
             for p in prop_names:
                 p_clean = p.lower().replace("-", "_")
-                if (
-                    k_clean == p_clean
-                    or k_clean in p_clean
-                    or p_clean in k_clean
-                    or (k_clean in ("count", "nodes", "replicas") and ("count" in p_clean or "replicas" in p_clean))
-                    or (k_clean in ("type", "flavor") and "tier" in p_clean)
-                    or (k_clean in ("region", "zone") and "region" in p_clean)
-                ):
+                if k_clean == p_clean:
+                    target_prop = p
+                    break
+                if (k_clean in ("count", "nodes") and "count" in p_clean) or (k_clean in ("type", "flavor") and "tier" in p_clean):
                     target_prop = p
                     break
 
-        if target_prop is not None:
-            prop_spec = props[target_prop]
-            prop_type = prop_spec.get("type")
+        # Discard hallucinated arguments not in properties
+        if target_prop is None:
+            continue
 
-            # Coerce types
-            if prop_type == "integer":
-                if isinstance(v, bool):
-                    cleaned_args[target_prop] = 1 if v else 0
-                elif isinstance(v, (int, float)):
-                    cleaned_args[target_prop] = int(v)
-                elif isinstance(v, str):
-                    digits = re.findall(r"\d+", v)
-                    if digits:
-                        cleaned_args[target_prop] = int(digits[0])
-                    else:
-                        cleaned_args[target_prop] = v
-                else:
-                    cleaned_args[target_prop] = v
-            elif prop_type == "number":
-                if isinstance(v, (int, float)):
-                    cleaned_args[target_prop] = float(v)
-                elif isinstance(v, str):
-                    nums = re.findall(r"[-+]?\d*\.?\d+", v)
-                    if nums:
-                        cleaned_args[target_prop] = float(nums[0])
-                    else:
-                        cleaned_args[target_prop] = v
-                else:
-                    cleaned_args[target_prop] = v
-            elif prop_type == "boolean":
-                if isinstance(v, bool):
-                    cleaned_args[target_prop] = v
-                elif isinstance(v, str):
-                    cleaned_args[target_prop] = v.strip().lower() in ("true", "1", "yes", "y")
-                elif isinstance(v, (int, float)):
-                    cleaned_args[target_prop] = bool(v)
-                else:
-                    cleaned_args[target_prop] = v
-            elif prop_type == "string":
-                v_str = str(v)
-                if "enum" in prop_spec:
-                    enums = prop_spec["enum"]
-                    if v_str in enums:
-                        cleaned_args[target_prop] = v_str
-                    elif v_str.upper() in enums:
-                        cleaned_args[target_prop] = v_str.upper()
-                    elif v_str.lower() in enums:
-                        cleaned_args[target_prop] = v_str.lower()
-                    else:
-                        matched_enum = None
-                        for e in enums:
-                            if e.lower() == v_str.lower():
-                                matched_enum = e
-                                break
-                        cleaned_args[target_prop] = matched_enum if matched_enum else v_str
-                else:
-                    cleaned_args[target_prop] = v_str
-            elif prop_type == "array" and isinstance(v, list):
-                cleaned_args[target_prop] = v
-            elif prop_type == "object" and isinstance(v, dict):
-                cleaned_args[target_prop] = v
+        prop_spec = props[target_prop]
+        prop_type = prop_spec.get("type")
+
+        # Coerce types
+        if prop_type == "integer":
+            if isinstance(v, bool):
+                cleaned_args[target_prop] = 1 if v else 0
+            elif isinstance(v, (int, float)):
+                cleaned_args[target_prop] = int(v)
+            elif isinstance(v, str):
+                digits = re.findall(r"[-+]?\d+", v)
+                cleaned_args[target_prop] = int(digits[0]) if digits else v
             else:
                 cleaned_args[target_prop] = v
+        elif prop_type == "number":
+            if isinstance(v, (int, float)):
+                cleaned_args[target_prop] = float(v)
+            elif isinstance(v, str):
+                nums = re.findall(r"[-+]?\d*\.?\d+", v)
+                cleaned_args[target_prop] = float(nums[0]) if nums else v
+            else:
+                cleaned_args[target_prop] = v
+        elif prop_type == "boolean":
+            if isinstance(v, bool):
+                cleaned_args[target_prop] = v
+            elif isinstance(v, str):
+                cleaned_args[target_prop] = v.strip().lower() in ("true", "1", "yes", "y")
+            elif isinstance(v, (int, float)):
+                cleaned_args[target_prop] = bool(v)
+            else:
+                cleaned_args[target_prop] = v
+        elif prop_type == "string":
+            v_str = str(v)
+            if "enum" in prop_spec:
+                enums = prop_spec["enum"]
+                if v_str in enums:
+                    cleaned_args[target_prop] = v_str
+                else:
+                    matched_enum = None
+                    for e in enums:
+                        if e.lower() == v_str.lower():
+                            matched_enum = e
+                            break
+                    cleaned_args[target_prop] = matched_enum if matched_enum else v_str
+            else:
+                cleaned_args[target_prop] = v_str
+        elif prop_type == "object":
+            if isinstance(v, dict):
+                cleaned_args[target_prop] = v
+            elif isinstance(v, str):
+                try:
+                    cleaned_args[target_prop] = json.loads(v)
+                except Exception:
+                    cleaned_args[target_prop] = v
+            else:
+                cleaned_args[target_prop] = v
+        elif prop_type == "array":
+            if isinstance(v, list):
+                cleaned_args[target_prop] = v
+            elif isinstance(v, str):
+                try:
+                    parsed_list = json.loads(v)
+                    cleaned_args[target_prop] = parsed_list if isinstance(parsed_list, list) else [v]
+                except Exception:
+                    cleaned_args[target_prop] = [v]
+            else:
+                cleaned_args[target_prop] = [v]
+        else:
+            cleaned_args[target_prop] = v
 
     return {"name": fn, "arguments": cleaned_args}
 

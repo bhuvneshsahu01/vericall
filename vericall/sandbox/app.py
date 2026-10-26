@@ -154,19 +154,27 @@ def get_tool_json_schema(name: str) -> Dict[str, Any]:
     defs = raw_schema.get("$defs", {})
     clean_props = {}
     for p_name, p_info in props.items():
-        cp = {"type": p_info.get("type", "string")}
-        if "enum" in p_info:
-            cp["enum"] = p_info["enum"]
-        if "items" in p_info:
-            it = p_info["items"]
-            if isinstance(it, dict) and "$ref" in it:
-                ref_name = it["$ref"].split("/")[-1]
-                sub_props = defs.get(ref_name, {}).get("properties", {})
-                cp["items"] = {"type": "object", "properties": {k: {"type": v.get("type", "string")} for k, v in sub_props.items()}}
-            elif isinstance(it, dict):
-                cp["items"] = {"type": it.get("type", "string")}
-            else:
-                cp["items"] = it
+        if "$ref" in p_info:
+            ref_name = p_info["$ref"].split("/")[-1]
+            sub_props = defs.get(ref_name, {}).get("properties", {})
+            cp = {
+                "type": "object",
+                "properties": {k: {"type": v.get("type", "string")} for k, v in sub_props.items()},
+            }
+        else:
+            cp = {"type": p_info.get("type", "string")}
+            if "enum" in p_info:
+                cp["enum"] = p_info["enum"]
+            if "items" in p_info:
+                it = p_info["items"]
+                if isinstance(it, dict) and "$ref" in it:
+                    ref_name = it["$ref"].split("/")[-1]
+                    sub_props = defs.get(ref_name, {}).get("properties", {})
+                    cp["items"] = {"type": "object", "properties": {k: {"type": v.get("type", "string")} for k, v in sub_props.items()}}
+                elif isinstance(it, dict):
+                    cp["items"] = {"type": it.get("type", "string")}
+                else:
+                    cp["items"] = it
         clean_props[p_name] = cp
 
     params_obj = {

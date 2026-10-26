@@ -116,7 +116,7 @@ def mutate_wrong_endpoint(func_name: str, args: Dict[str, Any], candidate_tools:
     return decoy_fn, args, res
 
 
-def mine_dpo_pairs(num_pairs: int = 1000) -> List[Dict[str, Any]]:
+def mine_dpo_pairs(num_pairs: int = 1000, force: bool = False) -> List[Dict[str, Any]]:
     """
     Constructs execution-verified DPO preference pairs (chosen vs rejected)
     with exact target failure distribution:
@@ -126,7 +126,7 @@ def mine_dpo_pairs(num_pairs: int = 1000) -> List[Dict[str, Any]]:
     - 100 (10%) wrong_endpoint
     """
     out_file = DATA_DIR / "train_dpo.jsonl"
-    if out_file.exists():
+    if out_file.exists() and not force:
         existing = [json.loads(line) for line in open(out_file, "r", encoding="utf-8") if line.strip()]
         if len(existing) >= num_pairs:
             print(f"[+] Loaded {len(existing[:num_pairs])} existing execution-verified DPO pairs from {out_file.name}")
@@ -223,4 +223,4 @@ def mine_dpo_pairs(num_pairs: int = 1000) -> List[Dict[str, Any]]:
 
 
 if __name__ == "__main__":
-    mine_dpo_pairs(1000)
+    mine_dpo_pairs(1000, force=True)
