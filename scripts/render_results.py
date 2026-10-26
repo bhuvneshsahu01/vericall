@@ -50,7 +50,7 @@ def format_markdown_table(data: dict) -> str:
 
 def format_latex_snippet(data: dict) -> str:
     configs = data.get("configs", {})
-    mcnemar = data.get("mcnemar_vs_base", {})
+    mcnemar = data.get("mcnemar_vs_base") or data.get("mcnemar_tests", {}).get("vericall_vs_base", {})
 
     base_acc = configs.get("base_model", {}).get("accuracy_pct", "[BASE]")
     sft_acc = configs.get("sft_only", {}).get("accuracy_pct", "[SFT]")
