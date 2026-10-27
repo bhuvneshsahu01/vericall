@@ -37,7 +37,7 @@ def format_markdown_table(data: dict) -> str:
             acc = f"{cfg.get('accuracy_pct', 0.0):.1f}%"
             ci = cfg.get("bootstrap_95_ci", [0.0, 0.0])
             ci_str = f"[{ci[0]:.1f}%, {ci[1]:.1f}%]"
-            errs = cfg.get("error_taxonomy", {})
+            errs = cfg.get("errors") or cfg.get("error_taxonomy", {})
             ij = errs.get("invalid_json", 0)
             we = errs.get("wrong_endpoint", 0)
             ma = errs.get("missing_arg", 0)
