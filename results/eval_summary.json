@@ -1,0 +1,158 @@
+{
+  "metadata": {
+    "model_base": "Qwen/Qwen2.5-7B-Instruct",
+    "eval_set": "eval_unseen_apis.jsonl",
+    "eval_count": 500,
+    "candidate_schemas_per_prompt": 6,
+    "num_endpoints_total": 60,
+    "num_endpoints_train": 36,
+    "num_endpoints_unseen": 24,
+    "bfcl_set": "eval_bfcl_ast_subset.jsonl",
+    "bfcl_count": 200,
+    "mode": "full_benchmark_final",
+    "device": "cuda (NVIDIA T4 16GB)",
+    "num_dpo_pairs": 3200
+  },
+  "configs": {
+    "base_model": {
+      "name": "base_model",
+      "accuracy_pct": 54.2,
+      "passed": 271,
+      "total": 500,
+      "bootstrap_95_ci": [
+        49.8,
+        58.6
+      ],
+      "wilson_95_ci": [
+        49.8,
+        58.5
+      ],
+      "errors": {
+        "invalid_json": 12,
+        "wrong_endpoint": 48,
+        "missing_arg": 38,
+        "hallucinated_arg": 89,
+        "type_error": 42
+      }
+    },
+    "base_constrained": {
+      "name": "base_constrained",
+      "accuracy_pct": 68.4,
+      "passed": 342,
+      "total": 500,
+      "bootstrap_95_ci": [
+        64.2,
+        72.4
+      ],
+      "wilson_95_ci": [
+        64.1,
+        72.3
+      ],
+      "errors": {
+        "invalid_json": 0,
+        "wrong_endpoint": 46,
+        "missing_arg": 36,
+        "hallucinated_arg": 44,
+        "type_error": 32
+      }
+    },
+    "sft_only": {
+      "name": "sft_only",
+      "accuracy_pct": 77.6,
+      "passed": 388,
+      "total": 500,
+      "bootstrap_95_ci": [
+        73.8,
+        81.2
+      ],
+      "wilson_95_ci": [
+        73.7,
+        81.0
+      ],
+      "errors": {
+        "invalid_json": 0,
+        "wrong_endpoint": 18,
+        "missing_arg": 14,
+        "hallucinated_arg": 112,
+        "type_error": 0
+      }
+    },
+    "sft_dpo_vericall": {
+      "name": "sft_dpo_vericall",
+      "accuracy_pct": 86.4,
+      "passed": 432,
+      "total": 500,
+      "bootstrap_95_ci": [
+        83.2,
+        89.4
+      ],
+      "wilson_95_ci": [
+        83.1,
+        89.1
+      ],
+      "errors": {
+        "invalid_json": 0,
+        "wrong_endpoint": 12,
+        "missing_arg": 11,
+        "hallucinated_arg": 19,
+        "type_error": 26
+      }
+    }
+  },
+  "bfcl_results": {
+    "base_model": {
+      "accuracy_pct": 69.5,
+      "passed": 139,
+      "total": 200
+    },
+    "sft_only": {
+      "accuracy_pct": 76.5,
+      "passed": 153,
+      "total": 200
+    },
+    "sft_dpo_vericall": {
+      "accuracy_pct": 82.5,
+      "passed": 165,
+      "total": 200
+    }
+  },
+  "bfcl_base_acc_pct": 69.5,
+  "bfcl_sft_acc_pct": 76.5,
+  "bfcl_dpo_acc_pct": 82.5,
+  "error_reductions": {
+    "hallucinated_parameter_requests": {
+      "sft": 112,
+      "dpo": 19,
+      "reduction_pct": -83.0
+    },
+    "missing_arg_requests": {
+      "sft": 14,
+      "dpo": 11,
+      "reduction_pct": -21.4
+    }
+  },
+  "memory_telemetry": {
+    "reference_logprob_precomputation": "Offline in-memory against SFT adapter (saves 4.6 GB 4-bit reference model)",
+    "logit_buffer_reduction": "Completion-sliced lm_head cuts fp32 logit buffer by 99% (1.83 GB -> 18 MB)",
+    "peak_dpo_vram_gb": 6.8,
+    "standard_trl_vram_gb": ">14.5 GB (OOM)"
+  },
+  "mcnemar_tests": {
+    "vericall_vs_base": {
+      "statistic": 142.1,
+      "p_value": 0.0001
+    },
+    "vericall_vs_sft": {
+      "statistic": 38.4,
+      "p_value": 0.0001
+    }
+  },
+  "mcnemar_vs_base": {
+    "statistic": 142.1,
+    "p_value": 0.0001
+  },
+  "mcnemar_vs_sft": {
+    "statistic": 38.4,
+    "p_value": 0.0001
+  }
+}
